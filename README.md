@@ -100,7 +100,7 @@ Create a Employee table with 10 dummy data in it with their departments and sala
 
 The agent will process your input using the Modal Context Protocol and return the relevant data from your SQL Server database.
 
-🧠 Tip: You can ask follow-up questions or make requests like "show me their employees" or "how many employees are under $40K?" — the context is preserved!
+🧠 Tip: You can ask follow-up questions or make requests like "show me the employees and their departments?" or "how many employees are having salary under $40K?" — the context is preserved!
 
 ## Conclusion
 
