@@ -64,6 +64,22 @@ logger.info(f"Configured to work with table: {FULLY_QUALIFIED_TABLE_NAME}")
 # Creating an MCP server instance
 mcp = FastMCP("Demo")
 
+def serialize_value(value):
+    """Convert SQL values to a serializable format for JSON"""
+    if value is None:
+        return None
+    elif isinstance(value, (datetime, bytes, bytearray)):
+        return str(value)
+    elif isinstance(value, (int, float, str, bool)):
+        # Handle NaN, Infinity values that cause JSON serialization issues
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            return str(value)
+        return value
+    elif hasattr(value, 'isoformat'):  # For date/time objects
+        return value.isoformat()
+    else:
+        return str(value)
+
 @mcp.tool()
 def get_table_schema() -> str:
     """Retrieve detailed schema information for the specific table."""
@@ -79,6 +95,17 @@ def get_table_schema() -> str:
         schema_info = []
         schema_info.append(f"Table: {FULLY_QUALIFIED_TABLE_NAME}")
         
+        # Dictionary to store all schema elements
+        schema_dict = {
+            "columns": [],
+            "numeric_columns": [],
+            "primary_keys": [],
+            "foreign_keys": [],
+            "indexes": [],
+            "row_count": None,
+            "numeric_stats": {}  # Will store statistics for numeric columns
+        }
+        
         # Get columns for the table with comprehensive details
         try:
             logger.debug(f"Querying columns for {FULLY_QUALIFIED_TABLE_NAME}")
@@ -89,7 +116,9 @@ def get_table_schema() -> str:
                     CHARACTER_MAXIMUM_LENGTH, 
                     IS_NULLABLE,
                     COLUMNPROPERTY(OBJECT_ID(CONCAT(TABLE_SCHEMA, '.', TABLE_NAME)), COLUMN_NAME, 'IsIdentity') AS IS_IDENTITY,
-                    COLUMN_DEFAULT
+                    COLUMN_DEFAULT,
+                    NUMERIC_PRECISION,
+                    NUMERIC_SCALE
                 FROM INFORMATION_SCHEMA.COLUMNS
                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
                 ORDER BY ORDINAL_POSITION
@@ -104,10 +133,32 @@ def get_table_schema() -> str:
             
             schema_info.append("\nColumn Details:")
             column_details = []
-            for col_name, data_type, max_length, is_nullable, is_identity, default_val in columns:
+            
+            # Collect numeric column names for statistics
+            numeric_column_names = []
+            
+            for col_name, data_type, max_length, is_nullable, is_identity, default_val, numeric_precision, numeric_scale in columns:
                 nullable_str = "NULL" if is_nullable == 'YES' else "NOT NULL"
                 identity_str = " IDENTITY" if is_identity == 1 else ""
                 default_str = f" DEFAULT {default_val}" if default_val else ""
+                
+                # Store column information in schema dictionary
+                column_info = {
+                    "name": col_name,
+                    "data_type": data_type,
+                    "max_length": max_length,
+                    "is_nullable": is_nullable == 'YES',
+                    "is_identity": is_identity == 1,
+                    "default": default_val,
+                    "numeric_precision": numeric_precision,
+                    "numeric_scale": numeric_scale
+                }
+                schema_dict["columns"].append(column_info)
+                
+                # Identify numeric columns for statistics
+                if data_type in ('int', 'bigint', 'smallint', 'tinyint', 'decimal', 'numeric', 'float', 'real', 'money', 'smallmoney'):
+                    numeric_column_names.append(col_name)
+                    schema_dict["numeric_columns"].append(column_info)
                 
                 if max_length and max_length != -1:
                     column_details.append(f"- {col_name}: {data_type}({max_length}) {nullable_str}{identity_str}{default_str}")
@@ -115,6 +166,9 @@ def get_table_schema() -> str:
                     column_details.append(f"- {col_name}: {data_type}(MAX) {nullable_str}{identity_str}{default_str}")
                 else:
                     column_details.append(f"- {col_name}: {data_type} {nullable_str}{identity_str}{default_str}")
+                
+                if numeric_precision and numeric_scale:
+                    column_details.append(f"    Precision: {numeric_precision}, Scale: {numeric_scale}")
             
             schema_info.extend(column_details)
         except Exception as e:
@@ -136,6 +190,8 @@ def get_table_schema() -> str:
             """, (MSSQL_TABLE_SCHEMA, MSSQL_TABLE_NAME))
             
             pk_columns = [row[0] for row in cursor.fetchall()]
+            schema_dict["primary_keys"] = pk_columns
+            
             if pk_columns:
                 logger.debug(f"Found primary keys for {FULLY_QUALIFIED_TABLE_NAME}: {', '.join(pk_columns)}")
                 schema_info.append(f"\nPrimary Key: {', '.join(pk_columns)}")
@@ -169,6 +225,16 @@ def get_table_schema() -> str:
             """, (MSSQL_TABLE_SCHEMA, MSSQL_TABLE_NAME))
             
             fk_results = cursor.fetchall()
+            schema_dict["foreign_keys"] = [
+                {
+                    "name": fk_name,
+                    "column": column,
+                    "referenced_table": ref_table,
+                    "referenced_column": ref_column
+                }
+                for fk_name, _, column, ref_table, ref_column in fk_results
+            ]
+            
             if fk_results:
                 schema_info.append("\nForeign Keys:")
                 for fk_name, _, column, ref_table, ref_column in fk_results:
@@ -205,6 +271,16 @@ def get_table_schema() -> str:
             """, (MSSQL_TABLE_SCHEMA, MSSQL_TABLE_NAME))
             
             idx_results = cursor.fetchall()
+            schema_dict["indexes"] = [
+                {
+                    "name": idx_name,
+                    "type": idx_type,
+                    "columns": columns.split(", "),
+                    "is_unique": is_unique
+                }
+                for idx_name, idx_type, columns, is_unique in idx_results
+            ]
+            
             if idx_results:
                 schema_info.append("\nIndexes:")
                 for idx_name, idx_type, columns, is_unique in idx_results:
@@ -220,11 +296,57 @@ def get_table_schema() -> str:
         try:
             cursor.execute(f"SELECT COUNT(*) FROM {FULLY_QUALIFIED_TABLE_NAME}")
             row_count = cursor.fetchone()[0]
+            schema_dict["row_count"] = row_count
             schema_info.append(f"\nApproximate Row Count: {row_count}")
         except Exception as e:
             logger.warning(f"Could not retrieve row count: {str(e)}")
             schema_info.append("\nRow Count: Unable to retrieve")
             
+        # Get statistics for numeric columns
+        if numeric_column_names:
+            try:
+                logger.debug(f"Collecting statistics for numeric columns: {numeric_column_names}")
+                schema_info.append("\nNumeric Column Statistics:")
+                
+                for column_name in numeric_column_names:
+                    try:
+                        # Try to get min, max, avg for each numeric column
+                        stats_query = f"""
+                            SELECT 
+                                MIN({column_name}) AS min_value,
+                                MAX({column_name}) AS max_value,
+                                AVG(CAST({column_name} AS FLOAT)) AS avg_value,
+                                COUNT({column_name}) AS count_value,
+                                COUNT(*) - COUNT({column_name}) AS null_count
+                            FROM {FULLY_QUALIFIED_TABLE_NAME}
+                            WHERE {column_name} IS NOT NULL
+                        """
+                        cursor.execute(stats_query)
+                        stats = cursor.fetchone()
+                        
+                        if stats and stats[0] is not None:
+                            min_val, max_val, avg_val, count_val, null_count = stats
+                            
+                            # Store in schema dictionary
+                            schema_dict["numeric_stats"][column_name] = {
+                                "min": min_val,
+                                "max": max_val,
+                                "avg": avg_val,
+                                "count": count_val,
+                                "null_count": null_count
+                            }
+                            
+                            # Format for display
+                            schema_info.append(f"- {column_name}:")
+                            schema_info.append(f"    Min: {min_val}, Max: {max_val}, Avg: {round(avg_val, 2) if avg_val is not None else 'N/A'}")
+                            schema_info.append(f"    Non-null values: {count_val}, Null values: {null_count}")
+                    except Exception as col_err:
+                        logger.warning(f"Could not retrieve statistics for column {column_name}: {str(col_err)}")
+                        schema_info.append(f"- {column_name}: Statistics unavailable")
+            except Exception as stats_err:
+                logger.warning(f"Error collecting numeric statistics: {str(stats_err)}")
+                schema_info.append("Could not collect numeric column statistics")
+        
         # Add sample queries
         schema_info.append(f"\nSample Queries:")
         schema_info.append(f"- SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}")
@@ -237,7 +359,7 @@ def get_table_schema() -> str:
         
         # Add sample data if available
         try:
-            cursor.execute(f"SELECT TOP 3 * FROM {FULLY_QUALIFIED_TABLE_NAME}")
+            cursor.execute(f"SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}")
             sample_rows = cursor.fetchall()
             
             if sample_rows and cursor.description:
@@ -259,8 +381,17 @@ def get_table_schema() -> str:
                 
                 table_str = tabulate.tabulate(table_data, headers=headers, tablefmt="grid")
                 schema_info.append(table_str)
+                
+                # Add schema information about the sample data
+                schema_dict["sample_data"] = {
+                    "columns": headers,
+                    "rows": [[serialize_value(item) for item in row] for row in sample_rows]
+                }
+            else:
+                schema_info.append("\nNo sample data available.")
         except Exception as e:
             logger.warning(f"Could not retrieve sample data: {str(e)}")
+            schema_info.append("\nCould not retrieve sample data.")
         
         logger.info("Successfully retrieved table schema information")
         return "\n".join(schema_info)
@@ -297,20 +428,6 @@ def is_select_query(sql):
     # Check if it starts with SELECT
     return sql.startswith('SELECT')
 
-def serialize_value(value):
-    """Safely serialize values for JSON, handling problematic types."""
-    if isinstance(value, (datetime, bytes, bytearray)):
-        return str(value)
-    elif isinstance(value, (int, float)):
-        # Handle NaN, Infinity values that cause JSON serialization issues
-        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
-            return str(value)
-        return value
-    elif value is None:
-        return None
-    else:
-        return str(value)
-
 @mcp.tool()
 def query_table(sql: str) -> str:
     """Execute SQL queries on the specific table and return results in tabular format."""
@@ -327,6 +444,32 @@ def query_table(sql: str) -> str:
             error_msg = f"Security error: Query must reference only the allowed table: {FULLY_QUALIFIED_TABLE_NAME}"
             logger.warning(error_msg)
             return f"Error: {error_msg}"
+    
+    # Check for date calculations that might produce negative results
+    date_calc_pattern = r'DATEDIFF\s*\(\s*\w+\s*,\s*(\w+)\s*,\s*(\w+)\s*\)'
+    date_calculations = re.findall(date_calc_pattern, sql, re.IGNORECASE)
+    
+    # Modify query to handle potential date calculation issues
+    if date_calculations and 'ABS(' not in sql_upper and 'CASE WHEN' not in sql_upper:
+        logger.info("Detected potential date calculation issue - suggesting modification")
+        for start_col, end_col in date_calculations:
+            # Create safer pattern for replacement
+            pattern = rf'DATEDIFF\s*\(\s*\w+\s*,\s*{start_col}\s*,\s*{end_col}\s*\)'
+            replacement = f'CASE WHEN {end_col} >= {start_col} THEN DATEDIFF(DAY, {start_col}, {end_col}) ELSE NULL END'
+            
+            # Check if we can safely modify the query
+            if re.search(pattern, sql):
+                modified_sql = re.sub(pattern, replacement, sql)
+                logger.info(f"Modified query to prevent negative date calculations: {modified_sql}")
+                
+                # Add a warning to the query results
+                warning_msg = (
+                    "NOTICE: The query was automatically modified to prevent negative date calculations. "
+                    "The original query might have returned negative values for date differences where "
+                    f"end date ({end_col}) precedes start date ({start_col}). Such records have been excluded "
+                    "from the calculation. Consider reviewing your data for date consistency."
+                )
+                sql = modified_sql
     
     # Check if this is a calculation query (likely to produce percentages or other float values)
     has_calculation = False
@@ -375,6 +518,10 @@ def query_table(sql: str) -> str:
             
             # Return combined output that's both human-readable and machine-parseable
             output = f"Query executed successfully. {len(rows)} rows returned.\n\n{table}\n\n"
+            
+            # If warning message exists from date calculation adjustment, add it
+            if 'warning_msg' in locals():
+                output = f"{warning_msg}\n\n{output}"
             
             # If this is a calculation query, use custom JSON serialization to handle floats properly
             if has_calculation:
@@ -710,6 +857,69 @@ def save_query_log(natural_language_query: str, sql_query: str, result_summary: 
     except Exception as e:
         logger.error(f"Error saving query log: {str(e)}", exc_info=True)
         return f"Error saving query log: {str(e)}"
+
+@mcp.tool()
+def get_recent_query_logs(num_logs: int = 5) -> str:
+    """Retrieve the most recent query logs.
+    
+    Args:
+        num_logs: Number of most recent logs to retrieve (default: 5)
+    
+    Returns:
+        A formatted string with summaries of recent query logs
+    """
+    logger.info(f"Retrieving {num_logs} most recent query logs")
+    
+    try:
+        log_dir = "logs/queries"
+        if not os.path.exists(log_dir):
+            return "No query logs found. The logs directory doesn't exist yet."
+        
+        # Get all log files sorted by modification time (newest first)
+        log_files = sorted(
+            [os.path.join(log_dir, f) for f in os.listdir(log_dir) if f.endswith('.json')],
+            key=os.path.getmtime,
+            reverse=True
+        )
+        
+        if not log_files:
+            return "No query logs found in the logs directory."
+        
+        # Limit to requested number
+        log_files = log_files[:num_logs]
+        
+        results = []
+        for log_file in log_files:
+            try:
+                with open(log_file, 'r') as f:
+                    log_data = json.load(f)
+                
+                # Extract key information
+                timestamp = log_data.get('timestamp', 'Unknown')
+                nl_query = log_data.get('natural_language_query', 'Unknown')
+                sql_query = log_data.get('final_sql_query', 'Unknown')
+                success = log_data.get('result', {}).get('success', False)
+                
+                # Count iterations
+                iterations = log_data.get('iterations', [])
+                iteration_count = len(iterations)
+                
+                # Format a summary
+                status = "✅ Success" if success else "❌ Failed"
+                log_summary = f"[{timestamp}] {status}\n"
+                log_summary += f"Natural language: {nl_query[:100]}{'...' if len(nl_query) > 100 else ''}\n"
+                log_summary += f"SQL: {sql_query[:100]}{'...' if len(sql_query) > 100 else ''}\n"
+                log_summary += f"Iterations: {iteration_count}\n"
+                log_summary += f"Log file: {os.path.basename(log_file)}\n"
+                
+                results.append(log_summary)
+            except Exception as e:
+                results.append(f"Error parsing log file {os.path.basename(log_file)}: {str(e)}")
+        
+        return "\n\n".join(results)
+    except Exception as e:
+        logger.error(f"Error retrieving query logs: {str(e)}", exc_info=True)
+        return f"Error retrieving query logs: {str(e)}"
 
 # Run our server
 if __name__ == "__main__":

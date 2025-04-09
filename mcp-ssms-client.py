@@ -86,17 +86,23 @@ class Chat:
     
     # More focused system prompt for query generation
     system_prompt: str = (
-        "You are a SQL Server assistant for table {table_name}. Create SQL queries based on "
-        "natural language questions. Use only columns from the schema provided below.\n\n"
+        "You are an AI assistant that helps users query and interact with the {table_name} table in SQL Server.\n\n"
+        "You only have access to this specific table, not the entire database.\n\n"
+        "CONTEXT ABOUT THE TABLE:\n"
         "{schema_summary}\n\n"
-        "SQL rules:\n"
-        "1. Only reference {table_name}\n"
-        "2. Use exact column names from schema\n"
-        "3. Match data types correctly\n"
-        "4. Handle NULLs appropriately\n"
-        "5. Use SQL Server syntax\n"
-        "6. Use efficient filtering\n"
-        "7. Include ORDER BY when relevant\n\n"
+        "IMPORTANT INSTRUCTIONS:\n"
+        "1. Always generate standard SQL Server T-SQL syntax\n"
+        "2. Reference columns EXACTLY as they appear in the schema\n"
+        "3. For any data modification, ask for user confirmation before executing\n"
+        "4. You can provide sample queries to help the user understand the table\n"
+        "5. When users ask complex questions, break down the approach\n"
+        "6. Inform users if a requested operation isn't possible with the table's structure\n"
+        "7. You can use the get_recent_query_logs tool to retrieve summaries of recent SQL queries and their results\n\n"
+        "COMMANDS:\n"
+        "- To run diagnostics on table access: /diagnose\n"
+        "- To view recent query logs: /show-logs [number]\n"
+        "- To refresh table schema: /refresh_schema\n"
+        "- To view query history: /history\n\n"
         "Format: TOOL: query_table, ARGS: {{\"sql\": \"<SQL_QUERY>\"}}"
     )
     
@@ -643,6 +649,7 @@ Schema retrieval encountered errors. Limited table information available:
         print("  /diagnose - Run diagnostics")
         print("  /refresh_schema - Refresh table schema")
         print("  /history - View query history")
+        print("  /show-logs [n] - View recent query logs (default: 5)")
         
         while True:
             try:
@@ -663,6 +670,17 @@ Schema retrieval encountered errors. Limited table information available:
                 continue
             elif query.lower() == "/history":
                 await self.show_query_history()
+                continue
+            elif query.lower().startswith("/show-logs"):
+                # Parse the number of logs to show
+                parts = query.split()
+                n = 5  # Default
+                if len(parts) > 1:
+                    try:
+                        n = int(parts[1])
+                    except ValueError:
+                        print("Invalid number. Using default of 5 logs.")
+                await self.show_recent_logs(session, n)
                 continue
             
             # Process regular queries
@@ -693,6 +711,20 @@ Schema retrieval encountered errors. Limited table information available:
             print("4. Use /refresh_schema to attempt to reload the schema")
         except Exception as e:
             print(f"Error running diagnostics: {e}")
+        print("===============================\n")
+
+    async def show_recent_logs(self, session: ClientSession, n: int = 5):
+        """Show recent query logs with their results."""
+        print(f"\n===== SHOWING {n} RECENT QUERY LOGS =====")
+        try:
+            result = await session.call_tool("get_recent_query_logs", {"n": n})
+            logs = getattr(result.content[0], "text", "")
+            if logs:
+                print(logs)
+            else:
+                print("No query logs found.")
+        except Exception as e:
+            print(f"Error retrieving query logs: {e}")
         print("===============================\n")
 
     async def run(self):
