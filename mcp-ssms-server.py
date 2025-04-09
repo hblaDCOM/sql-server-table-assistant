@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 import tabulate
 import re
+import math
 
 load_dotenv()
 
@@ -296,6 +297,20 @@ def is_select_query(sql):
     # Check if it starts with SELECT
     return sql.startswith('SELECT')
 
+def serialize_value(value):
+    """Safely serialize values for JSON, handling problematic types."""
+    if isinstance(value, (datetime, bytes, bytearray)):
+        return str(value)
+    elif isinstance(value, (int, float)):
+        # Handle NaN, Infinity values that cause JSON serialization issues
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            return str(value)
+        return value
+    elif value is None:
+        return None
+    else:
+        return str(value)
+
 @mcp.tool()
 def query_table(sql: str) -> str:
     """Execute SQL queries on the specific table and return results in tabular format."""
@@ -312,6 +327,12 @@ def query_table(sql: str) -> str:
             error_msg = f"Security error: Query must reference only the allowed table: {FULLY_QUALIFIED_TABLE_NAME}"
             logger.warning(error_msg)
             return f"Error: {error_msg}"
+    
+    # Check if this is a calculation query (likely to produce percentages or other float values)
+    has_calculation = False
+    if any(op in sql_upper for op in [' / ', '*', '+', '-', 'AVG(', 'SUM(', 'COUNT(', 'CAST(', 'CONVERT(']):
+        has_calculation = True
+        logger.debug("Query contains calculations - special handling will be applied")
     
     conn = None
     try:
@@ -337,16 +358,14 @@ def query_table(sql: str) -> str:
             for row in results:
                 processed_row = []
                 for item in row:
-                    if isinstance(item, (datetime, bytes, bytearray)):
-                        processed_row.append(str(item))
-                    else:
-                        processed_row.append(item)
+                    # Special handling for float values from calculations
+                    processed_row.append(serialize_value(item))
                 rows.append(processed_row)
             
             # Create tabular output using tabulate
             table = tabulate.tabulate(rows, headers=headers, tablefmt="grid")
             
-            # Also prepare JSON for possible programmatic use
+            # Prepare JSON data with special handling for float values
             json_data = []
             for row in rows:
                 json_row = {}
@@ -354,17 +373,31 @@ def query_table(sql: str) -> str:
                     json_row[header] = row[i]
                 json_data.append(json_row)
             
-            # Return both formats
-            result = {
-                "tabular": table,
-                "json": json_data,
-                "row_count": len(rows),
-                "columns": headers
-            }
-            
             # Return combined output that's both human-readable and machine-parseable
             output = f"Query executed successfully. {len(rows)} rows returned.\n\n{table}\n\n"
-            output += "JSON_DATA:" + json.dumps(json_data)
+            
+            # If this is a calculation query, use custom JSON serialization to handle floats properly
+            if has_calculation:
+                try:
+                    # Use a custom JSON encoder to handle special float values
+                    class CustomJSONEncoder(json.JSONEncoder):
+                        def default(self, obj):
+                            return serialize_value(obj)
+                    
+                    json_str = json.dumps(json_data, cls=CustomJSONEncoder)
+                    output += "JSON_DATA:" + json_str
+                except Exception as json_err:
+                    logger.error(f"JSON serialization error: {json_err}")
+                    # Fallback: convert problematic values to strings
+                    for row_data in json_data:
+                        for key, value in row_data.items():
+                            if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                                row_data[key] = str(value)
+                    
+                    output += "JSON_DATA:" + json.dumps(json_data)
+            else:
+                # Standard serialization for non-calculation queries
+                output += "JSON_DATA:" + json.dumps(json_data)
             
             return output
         else:
@@ -591,32 +624,86 @@ def save_query_log(natural_language_query: str, sql_query: str, result_summary: 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_file = os.path.join(log_dir, f"query_{timestamp}.json")
         
+        # Check for calculations in the SQL which might cause serialization issues
+        has_calculation = any(op in sql_query.upper() 
+                           for op in [' / ', '*', '+', '-', 'AVG(', 'SUM(', 'COUNT(', 'CAST(', 'CONVERT('])
+        
         # Extract row count and first few rows from result summary
         result_info = {
             "success": not result_summary.startswith("Error"),
             "summary": result_summary.split("\n\nJSON_DATA:")[0] if "JSON_DATA:" in result_summary else result_summary
         }
         
-        # Extract JSON data if available
-        if "JSON_DATA:" in result_summary:
-            json_str = result_summary.split("JSON_DATA:")[1]
+        # Extract JSON data if available, with special handling for calculations
+        if "JSON_DATA:" in result_summary and not has_calculation:
+            # Standard handling for non-calculation queries
             try:
+                json_str = result_summary.split("JSON_DATA:")[1]
                 result_info["data"] = json.loads(json_str)
-            except:
-                result_info["data"] = "JSON parsing failed"
+            except json.JSONDecodeError:
+                # If there's a parsing error, try to sanitize the JSON
+                try:
+                    json_str = result_summary.split("JSON_DATA:")[1].strip()
+                    # Replace problematic values
+                    json_str = json_str.replace('NaN', '"NaN"').replace('Infinity', '"Infinity"').replace('-Infinity', '"-Infinity"')
+                    result_info["data"] = json.loads(json_str)
+                except:
+                    result_info["data"] = "JSON parsing failed - serialization issue with results"
+        elif "JSON_DATA:" in result_summary and has_calculation:
+            # For calculation queries, store a message instead of trying to parse potentially problematic JSON
+            result_info["data"] = "JSON data omitted for calculation query to avoid serialization issues"
         
-        # Create log entry
-        log_entry = {
-            "timestamp": timestamp,
-            "natural_language_query": natural_language_query,
-            "final_sql_query": sql_query,
-            "result": result_info,
-            "iterations": iterations
-        }
-        
-        # Write to file
-        with open(log_file, 'w') as f:
-            json.dump(log_entry, f, indent=2, default=str)
+        # Create log entry with fallbacks for serialization issues
+        try:
+            # First try to create the log entry normally
+            log_entry = {
+                "timestamp": timestamp,
+                "natural_language_query": natural_language_query,
+                "final_sql_query": sql_query,
+                "result": result_info,
+                "iterations": iterations
+            }
+            
+            # Use a custom encoder that can handle special float values
+            class CustomJSONEncoder(json.JSONEncoder):
+                def default(self, obj):
+                    if isinstance(obj, (datetime, bytes, bytearray)):
+                        return str(obj)
+                    elif isinstance(obj, float):
+                        if math.isnan(obj) or math.isinf(obj):
+                            return str(obj)
+                    return super().default(obj)
+            
+            # Write to file with the custom encoder
+            with open(log_file, 'w') as f:
+                json.dump(log_entry, f, indent=2, cls=CustomJSONEncoder, default=str)
+                
+        except (TypeError, ValueError, OverflowError) as json_err:
+            # If serialization fails with custom encoder, create a simplified log entry
+            logger.warning(f"JSON serialization issue with primary method: {json_err}")
+            
+            # Create a simplified log entry with minimal data
+            simple_log = {
+                "timestamp": timestamp,
+                "natural_language_query": natural_language_query,
+                "final_sql_query": sql_query,
+                "result": {
+                    "success": result_info["success"],
+                    "summary": "Results omitted due to serialization issues",
+                },
+                "iterations": [
+                    {
+                        "iteration": i.get("iteration", idx+1),
+                        "sql": i.get("sql", ""),
+                        "feedback": i.get("feedback", ""),
+                        "executed": i.get("executed", False)
+                    } for idx, i in enumerate(iterations)
+                ]
+            }
+            
+            # Try to write the simplified log
+            with open(log_file, 'w') as f:
+                json.dump(simple_log, f, indent=2, default=str)
         
         logger.info(f"Query log saved to {log_file}")
         return f"Query log saved successfully to {log_file}"

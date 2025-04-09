@@ -3,6 +3,7 @@ import os
 import re
 import json
 import time
+import math
 from dataclasses import dataclass, field
 from typing import cast, List, Dict, Any, Optional
 import sys
@@ -285,6 +286,16 @@ Schema retrieval encountered errors. Limited table information available:
         
         return None
 
+    # Add a custom JSON encoder class to handle special float values
+    class CustomJSONEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, (datetime, bytes, bytearray)):
+                return str(obj)
+            elif isinstance(obj, float):
+                if math.isnan(obj) or math.isinf(obj):
+                    return str(obj)
+            return super().default(obj)
+
     async def process_query(self, session: ClientSession, query: str) -> None:
         """Process a natural language query, generate SQL, and execute it with user approval."""
         print(f"\nProcessing query: {query}")
@@ -329,6 +340,10 @@ Schema retrieval encountered errors. Limited table information available:
                 current_iteration.executed = True
                 
                 try:
+                    # Detect if this is likely a calculation/percentage query
+                    has_calculation = any(op in current_iteration.generated_sql.upper() 
+                                          for op in [' / ', '*', '+', '-', 'AVG(', 'SUM(', 'COUNT(', 'CAST(', 'CONVERT('])
+                    
                     result = await session.call_tool("query_table", {"sql": current_iteration.generated_sql})
                     result_text = getattr(result.content[0], "text", "")
                     current_iteration.results = result_text
@@ -350,7 +365,7 @@ Schema retrieval encountered errors. Limited table information available:
                         "content": f"SQL query executed: {execution_summary}"
                     })
                     
-                    # Save query log
+                    # Save query log - handle JSON serialization carefully
                     iterations_data = []
                     for i, iter_data in enumerate(self.current_query_iterations):
                         iterations_data.append({
@@ -360,17 +375,36 @@ Schema retrieval encountered errors. Limited table information available:
                             "executed": iter_data.executed
                         })
                     
+                    # Prepare a simplified result summary for logging if there are calculation issues
+                    safe_result_summary = result_text
+                    if has_calculation and "JSON_DATA:" in result_text:
+                        # Only keep the tabular part for the log to avoid serialization issues
+                        safe_result_summary = result_text.split("\n\nJSON_DATA:")[0]
+                        safe_result_summary += "\n\n[JSON data omitted for calculation query]"
+                    
                     try:
                         log_result = await session.call_tool("save_query_log", {
                             "natural_language_query": query,
                             "sql_query": current_iteration.generated_sql,
-                            "result_summary": result_text,
+                            "result_summary": safe_result_summary,
                             "iterations": iterations_data
                         })
                         log_message = getattr(log_result.content[0], "text", "")
                         print(f"\n{log_message}")
                     except Exception as log_err:
                         print(f"Error saving query log: {log_err}")
+                        # Try with a more minimal result summary if the first attempt failed
+                        try:
+                            minimal_summary = f"Query executed successfully. Results not logged due to serialization issues."
+                            log_result = await session.call_tool("save_query_log", {
+                                "natural_language_query": query,
+                                "sql_query": current_iteration.generated_sql,
+                                "result_summary": minimal_summary,
+                                "iterations": iterations_data
+                            })
+                            print("Query log saved with minimal results due to serialization issues.")
+                        except Exception as retry_err:
+                            print(f"Failed to save query log even with minimal results: {retry_err}")
                     
                     # Add to query history
                     query_record = {
@@ -412,12 +446,22 @@ Schema retrieval encountered errors. Limited table information available:
         
         # Extract JSON data for potential programmatic use
         if "JSON_DATA:" in result_text:
-            json_str = result_text.split("JSON_DATA:")[1]
             try:
+                json_str = result_text.split("JSON_DATA:")[1]
                 # This would be available for programmatic use but we don't display it
                 json_data = json.loads(json_str)
-            except:
-                pass
+            except json.JSONDecodeError as e:
+                print(f"\nWarning: Could not parse JSON results: {str(e)}")
+                # Try to extract the JSON data with manual processing if the automatic parsing failed
+                try:
+                    # This is a fallback for when standard JSON parsing fails
+                    json_str = result_text.split("JSON_DATA:")[1].strip()
+                    # Replace common problematic values that might cause JSON parsing issues
+                    json_str = json_str.replace('NaN', '"NaN"').replace('Infinity', '"Infinity"').replace('-Infinity', '"-Infinity"')
+                    json_data = json.loads(json_str)
+                    print("Successfully recovered JSON data with fallback method.")
+                except Exception as deep_error:
+                    print(f"Failed to recover JSON data: {deep_error}")
         
         print("==========================\n")
     
