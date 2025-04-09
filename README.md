@@ -15,6 +15,7 @@ This application lets you interact with a specific SQL Server table using natura
 * **MCP-Enhanced Accuracy**: Achieve precise table interactions through Modal Context Protocol
 * **Context-Aware Conversations**: Maintain context across multiple queries
 * **Natural Language Explanations**: Get plain English explanations of query results
+* **Token Optimization**: Smart caching and context management to minimize API usage
 
 ## What is MCP?
 MCP (Modal Context Protocol) is a methodology that standardizes how context is bound to LLMs, providing a standard way to connect AI models to different data sources and tools.
@@ -27,6 +28,20 @@ This application runs in "Single Table Mode" which provides several advantages:
 2. **Simpler Permissions**: Users need minimal permissions (just for the specific table)
 3. **Focused Experience**: The assistant is specialized for working with just one table
 4. **Reduced Risk**: Prevents accidental access to sensitive data in other tables
+
+## Token Optimization
+
+This application implements several strategies to minimize token usage and prevent rate limiting:
+
+1. **Smart Schema Summarization**: Instead of sending the entire table schema to the model, a concise summary is created
+2. **Response Caching**: Similar queries and explanations are cached to avoid redundant API calls
+3. **Minimal Prompt Design**: System prompts and user instructions are optimized for brevity
+4. **Conversation Management**: Only recent and relevant messages are included in the context
+5. **Dedicated System Prompts**: Different prompts for different tasks (schema, query generation, explanations)
+6. **Selective Result Transmission**: Large result sets are trimmed before being sent to the model
+7. **Token Parameter Tuning**: Request parameters like max_tokens are set conservatively
+
+These optimizations allow the application to function smoothly even with large tables and complex queries, while staying within API rate limits.
 
 ## Prerequisites
 Before you get started, make sure you have the following:
@@ -242,6 +257,16 @@ If you encounter connection issues:
 3. Check firewall settings to allow SQL Server traffic
 4. Verify that the ODBC driver specified in your .env file is installed
 5. Test connectivity with other tools like SSMS or sqlcmd
+
+## Troubleshooting Token Usage
+
+If you encounter rate limit errors with Azure OpenAI:
+
+1. **Wait before retrying**: Rate limits are usually time-based, so waiting 60 seconds may resolve the issue
+2. **Increase your quota**: Visit https://aka.ms/oai/quotaincrease to request a higher rate limit
+3. **Upgrade your tier**: Free accounts may need to upgrade to Pay-as-you-Go
+4. **Use the /refresh_schema command**: This regenerates the schema summary which might reduce token usage
+5. **Check your prompt length**: Very complex questions might trigger more token usage
 
 ## License
 

@@ -71,30 +71,100 @@ class QueryIteration:
 class Chat:
     messages: list[dict] = field(default_factory=list)
     table_schema: str = ""
+    schema_summary: str = ""  # Add a more concise schema summary
     current_query_iterations: List[QueryIteration] = field(default_factory=list)
     query_history: List[Dict[str, Any]] = field(default_factory=list)
-    system_prompt: str = (
-        "You are a MS SQL Server assistant focused on the specific table {table_name}. "
-        "Your job is to help users query and interact with this table using SQL. "
-        "You have access to a single table and cannot access any other tables in the database.\n\n"
-        "{schema_info}\n\n"
-        "When writing SQL queries:\n"
-        "1. Only reference the table {table_name} in your queries\n"
-        "2. Always reference columns exactly as they appear in the schema\n"
-        "3. Pay attention to data types when filtering\n"
-        "4. Consider the nullability of columns in your WHERE clauses\n"
-        "5. Use appropriate SQL Server syntax for your queries\n"
-        "6. Make your queries efficient with appropriate WHERE clauses\n"
-        "7. Include ORDER BY clauses when relevant for better presentation\n\n"
-        "If the user provides feedback on your SQL query, incorporate that feedback in your next iteration.\n\n"
-        "When you need to execute a SQL query, you MUST use this EXACT format with no additional text:\n"
-        "TOOL: query_table, ARGS: {{\"sql\": \"<YOUR_SQL_QUERY>\"}}\n\n"
-        "This is critical: always formulate valid SQL queries that only work with the table {table_name} "
-        "and use the exact TOOL format above. Be precise and careful with your SQL queries as they "
-        "will be shown to the user for approval before execution. Use the provided table schema to "
-        "write accurate queries with correct column names. Do not explain that you're going to execute "
-        "a query, just execute it directly."
+    response_cache: Dict[str, Any] = field(default_factory=dict)  # Cache for model responses
+    
+    # Minimal system prompt for initial schema retrieval
+    schema_system_prompt: str = (
+        "You are an assistant that creates SQL queries for table {table_name}. "
+        "Examine the schema and create a concise summary highlighting the most important aspects. "
+        "Focus on key columns, data types, relationships, and typical query patterns."
     )
+    
+    # More focused system prompt for query generation
+    system_prompt: str = (
+        "You are a SQL Server assistant for table {table_name}. Create SQL queries based on "
+        "natural language questions. Use only columns from the schema provided below.\n\n"
+        "{schema_summary}\n\n"
+        "SQL rules:\n"
+        "1. Only reference {table_name}\n"
+        "2. Use exact column names from schema\n"
+        "3. Match data types correctly\n"
+        "4. Handle NULLs appropriately\n"
+        "5. Use SQL Server syntax\n"
+        "6. Use efficient filtering\n"
+        "7. Include ORDER BY when relevant\n\n"
+        "Format: TOOL: query_table, ARGS: {{\"sql\": \"<SQL_QUERY>\"}}"
+    )
+    
+    # Minimal system prompt for result explanation
+    explanation_system_prompt: str = (
+        "You are a data analyst explaining SQL query results in plain language. "
+        "Be brief and focus on key insights from the data."
+    )
+
+    async def create_schema_summary(self, full_schema: str) -> str:
+        """Create a concise summary of the schema for use in the system prompt."""
+        # Check if we can parse it ourselves first
+        try:
+            lines = full_schema.split('\n')
+            table_name = ""
+            columns = []
+            primary_key = ""
+            
+            # Extract basic schema elements
+            for line in lines:
+                if line.startswith("Table:"):
+                    table_name = line.split("Table:")[1].strip()
+                elif ":" not in line and line.strip().startswith("- ") and ":" in line:
+                    columns.append(line.strip()[2:])  # Remove "- " prefix
+                elif line.startswith("Primary Key:"):
+                    primary_key = line.split("Primary Key:")[1].strip()
+            
+            if table_name and columns:
+                summary = f"Table: {table_name}\nColumns: {', '.join(columns[:10])}"
+                if len(columns) > 10:
+                    summary += f" plus {len(columns) - 10} more"
+                if primary_key:
+                    summary += f"\nPrimary Key: {primary_key}"
+                return summary
+        except Exception:
+            pass
+        
+        # If parsing fails, use the model (but with minimal token usage)
+        cache_key = f"schema_summary:{hash(full_schema)}"
+        if cache_key in self.response_cache:
+            return self.response_cache[cache_key]
+        
+        try:
+            # Only send a concise version of the schema
+            schema_preview = "\n".join(full_schema.split('\n')[:50])
+            if len(full_schema.split('\n')) > 50:
+                schema_preview += "\n... (additional schema details omitted)"
+            
+            prompt = f"Create a concise summary of this database schema, highlighting only the most important columns and relationships:\n\n{schema_preview}"
+            
+            completion_params = {
+                "messages": [
+                    {"role": "system", "content": self.schema_system_prompt.format(table_name=FULLY_QUALIFIED_TABLE_NAME)},
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 500,
+                "temperature": 0.0,
+                "model": os.getenv("AZURE_OPENAI_DEPLOYMENT_ID")
+            }
+            
+            completion = client.chat.completions.create(**completion_params)
+            summary = completion.choices[0].message.content.strip()
+            
+            # Cache the result
+            self.response_cache[cache_key] = summary
+            return summary
+        except Exception as e:
+            print(f"Warning: Could not create schema summary: {e}")
+            return "Schema available but summarization failed. Refer to full table name and use column names exactly as they appear."
 
     async def fetch_schema(self, session: ClientSession) -> None:
         """Fetch the table schema and update the system prompt."""
@@ -118,6 +188,9 @@ class Chat:
                 print("Attempting to retrieve basic table information instead...")
             else:
                 print("Schema information fetched successfully.")
+                # Create a concise schema summary to reduce token usage
+                self.schema_summary = await self.create_schema_summary(self.table_schema)
+                print("Created concise schema summary.")
         except Exception as e:
             error_message = f"Error fetching schema: {str(e)}"
             print("\n===== TABLE SCHEMA ERROR =====")
@@ -136,7 +209,10 @@ class Chat:
                 print("Basic table information retrieved:")
                 print(basic_info)
                 
-                # Combine error and basic info
+                # Use basic info as the schema summary
+                self.schema_summary = basic_info
+                
+                # Combine error and basic info for the full schema
                 self.table_schema = f"""
 Schema retrieval encountered errors. Limited table information available:
 
@@ -147,20 +223,19 @@ Schema retrieval encountered errors. Limited table information available:
             except Exception as basic_error:
                 print(f"Error retrieving basic table info: {basic_error}")
                 self.table_schema = "Both full schema and basic table information retrieval failed."
+                self.schema_summary = f"Table: {FULLY_QUALIFIED_TABLE_NAME}"
             
-        # Update the system prompt with schema information
-        formatted_schema_info = f"TABLE SCHEMA INFORMATION:\n{self.table_schema}" if self.table_schema else "Schema information not available."
-        
+        # Update the system prompt with schema information - use the summary instead of full schema
         try:
             self.system_prompt = self.system_prompt.format(
-                schema_info=formatted_schema_info,
+                schema_summary=self.schema_summary,
                 table_name=FULLY_QUALIFIED_TABLE_NAME
             )
-            print("System prompt updated with table schema information.")
+            print("System prompt updated with schema summary.")
         except Exception as format_error:
             print(f"Error formatting system prompt: {format_error}")
             # Fallback to direct replacement if formatting fails
-            self.system_prompt = self.system_prompt.replace("{schema_info}", formatted_schema_info)
+            self.system_prompt = self.system_prompt.replace("{schema_summary}", self.schema_summary)
             self.system_prompt = self.system_prompt.replace("{table_name}", FULLY_QUALIFIED_TABLE_NAME)
 
     def extract_sql_from_assistant_reply(self, assistant_reply: str) -> Optional[Dict[str, Any]]:
@@ -217,7 +292,9 @@ Schema retrieval encountered errors. Limited table information available:
         # Reset query iterations for new query
         self.current_query_iterations = []
         
-        # Add user query to conversation history
+        # Add user query to conversation history 
+        # But limit history to just the last 3 exchanges to save tokens
+        self.messages = self.messages[-6:] if len(self.messages) > 6 else self.messages
         self.messages.append({"role": "user", "content": query})
         
         # Generate SQL (first iteration)
@@ -259,10 +336,18 @@ Schema retrieval encountered errors. Limited table information available:
                     # Extract and display tabular results
                     self.display_query_results(result_text)
                     
-                    # Add the result to conversation history
+                    # Add just the execution result to conversation history (not the full result text)
+                    execution_summary = "Query executed successfully."
+                    if "rows returned" in result_text:
+                        try:
+                            rows_count = re.search(r"(\d+) rows returned", result_text).group(1)
+                            execution_summary = f"Query executed successfully. {rows_count} rows returned."
+                        except:
+                            pass
+                            
                     self.messages.append({
                         "role": "system",
-                        "content": f"SQL query executed:\n{current_iteration.generated_sql}\n\nResults:\n{result_text}"
+                        "content": f"SQL query executed: {execution_summary}"
                     })
                     
                     # Save query log
@@ -297,7 +382,8 @@ Schema retrieval encountered errors. Limited table information available:
                     }
                     self.query_history.append(query_record)
                     
-                    # Generate natural language explanation of results
+                    # Generate natural language explanation of results, but with fewer tokens
+                    # Use the dedicated explanation system prompt
                     await self.generate_result_explanation(session, query, current_iteration.generated_sql, result_text)
                     
                 except Exception as e:
@@ -339,110 +425,134 @@ Schema retrieval encountered errors. Limited table information available:
         """Generate a SQL query iteration based on the original query and optional feedback."""
         iteration_number = len(self.current_query_iterations) + 1
         
-        # Build the prompt based on iteration
-        prompt = original_query
-        
-        if iteration_number > 1 and feedback:
-            # For subsequent iterations, include the original query, previous SQL, and feedback
+        # Build the prompt based on iteration - keep it minimal
+        if feedback and iteration_number > 1:
+            # For subsequent iterations, just include what's changed - be token efficient
             previous_sql = self.current_query_iterations[-1].generated_sql
-            prompt = (
-                f"Original question: {original_query}\n\n"
-                f"Your previous SQL query: {previous_sql}\n\n"
-                f"My feedback: {feedback}\n\n"
-                f"Please generate an improved SQL query that addresses this feedback."
+            prompt = f"Original question: {original_query}\n\nCurrent SQL: {previous_sql}\n\nFeedback: {feedback}\n\nGenerate improved SQL."
+        else:
+            # First iteration, just the query
+            prompt = original_query
+        
+        # Generate a cache key for this query/feedback combination
+        cache_key = f"sql:{hash(prompt)}"
+        if cache_key in self.response_cache:
+            print("Using cached SQL response")
+            assistant_reply = self.response_cache[cache_key]
+        else:
+            # Build minimal conversation for OpenAI
+            openai_messages = [
+                {"role": "system", "content": self.system_prompt},
+            ]
+            
+            # Only include 1-2 previous exchanges to minimize tokens
+            if iteration_number > 1 and len(self.messages) >= 2:
+                # Add just the most recent exchange
+                openai_messages.extend(self.messages[-2:])
+            
+            openai_messages.append({"role": "user", "content": prompt})
+            
+            # Send to OpenAI with minimal token settings
+            completion_params = {
+                "messages": openai_messages,
+                "max_tokens": 1000,  # Reduced from 2000
+                "temperature": 0.0,
+                "model": os.getenv("AZURE_OPENAI_DEPLOYMENT_ID")
+            }
+            
+            try:
+                completion = client.chat.completions.create(**completion_params)
+                assistant_reply = completion.choices[0].message.content
+                
+                # Cache the response
+                self.response_cache[cache_key] = assistant_reply
+            except Exception as e:
+                print(f"Error generating SQL: {str(e)}")
+                return
+        
+        # Extract SQL from reply
+        extracted = self.extract_sql_from_assistant_reply(assistant_reply)
+        
+        if extracted and extracted.get("tool_name") == "query_table" and "sql" in extracted.get("args", {}):
+            sql_query = extracted["args"]["sql"]
+            
+            # Create a new iteration record
+            iteration = QueryIteration(
+                iteration_number=iteration_number,
+                natural_language_query=prompt,
+                generated_sql=sql_query,
+                feedback=feedback if iteration_number > 1 else None
             )
-        
-        # Build conversation for OpenAI
-        openai_messages = [
-            {"role": "system", "content": self.system_prompt},
-        ]
-        
-        # Include previous iterations in context if this isn't the first iteration
-        if iteration_number > 1:
-            # Add relevant conversation history but exclude the most recent feedback request
-            for msg in self.messages[:-1]:  
-                openai_messages.append(msg)
-        
-        openai_messages.append({"role": "user", "content": prompt})
-        
-        # Send to OpenAI
-        completion_params = {
-            "messages": openai_messages,
-            "max_tokens": 2000,
-            "temperature": 0.0,
-            "model": os.getenv("AZURE_OPENAI_DEPLOYMENT_ID")
-        }
-        
-        try:
-            completion = client.chat.completions.create(**completion_params)
-            assistant_reply = completion.choices[0].message.content
             
-            # Extract SQL from reply
-            extracted = self.extract_sql_from_assistant_reply(assistant_reply)
+            self.current_query_iterations.append(iteration)
             
-            if extracted and extracted.get("tool_name") == "query_table" and "sql" in extracted.get("args", {}):
-                sql_query = extracted["args"]["sql"]
-                
-                # Create a new iteration record
-                iteration = QueryIteration(
-                    iteration_number=iteration_number,
-                    natural_language_query=prompt,
-                    generated_sql=sql_query,
-                    feedback=feedback if iteration_number > 1 else None
-                )
-                
-                self.current_query_iterations.append(iteration)
-                
-                # For first iteration, add assistant's full response to conversation history
-                if iteration_number == 1:
-                    self.messages.append({"role": "assistant", "content": assistant_reply})
-                
-                print(f"\nSQL query generated (iteration {iteration_number}).")
-            else:
-                print(f"\n===== SQL EXTRACTION ERROR =====")
-                print("Could not extract valid SQL from assistant's response:")
-                print(assistant_reply)
-                print("=================================\n")
-                
-                # Fall back to asking the user for SQL directly
-                sql_query = get_input("Please enter the SQL query manually: ")
-                
-                # Create a new iteration record with manual SQL
-                iteration = QueryIteration(
-                    iteration_number=iteration_number,
-                    natural_language_query=prompt,
-                    generated_sql=sql_query,
-                    feedback=feedback if iteration_number > 1 else None
-                )
-                
-                self.current_query_iterations.append(iteration)
-        except Exception as e:
-            print(f"Error generating SQL: {str(e)}")
+            # For first iteration, add assistant's response to conversation history (but not the full response)
+            if iteration_number == 1:
+                self.messages.append({
+                    "role": "assistant", 
+                    "content": f"I'll run a SQL query to answer this question."
+                })
+            
+            print(f"\nSQL query generated (iteration {iteration_number}).")
+        else:
+            print(f"\n===== SQL EXTRACTION ERROR =====")
+            print("Could not extract valid SQL from assistant's response:")
+            print(assistant_reply)
+            print("=================================\n")
+            
+            # Fall back to asking the user for SQL directly
+            sql_query = get_input("Please enter the SQL query manually: ")
+            
+            # Create a new iteration record with manual SQL
+            iteration = QueryIteration(
+                iteration_number=iteration_number,
+                natural_language_query=prompt,
+                generated_sql=sql_query,
+                feedback=feedback if iteration_number > 1 else None
+            )
+            
+            self.current_query_iterations.append(iteration)
     
     async def generate_result_explanation(self, session: ClientSession, 
                                          query: str, sql: str, results: str) -> None:
-        """Generate a natural language explanation of the query results."""
+        """Generate a natural language explanation of the query results with minimal tokens."""
+        # Check cache first
+        cache_key = f"explanation:{hash(results)}"
+        if cache_key in self.response_cache:
+            explanation = self.response_cache[cache_key]
+            print("\n===== RESULT EXPLANATION =====")
+            print(explanation)
+            print("==============================\n")
+            self.messages.append({"role": "assistant", "content": explanation})
+            return
+            
         # Extract just the tabular part for the explanation (without the JSON)
+        # And limit the size to reduce token usage
         results_for_explanation = results.split("\n\nJSON_DATA:")[0] if "JSON_DATA:" in results else results
         
+        # Further reduce token count by limiting the result size if needed
+        if len(results_for_explanation.split('\n')) > 15:
+            results_preview = "\n".join(results_for_explanation.split('\n')[:15])
+            results_for_explanation = f"{results_preview}\n\n[...additional rows omitted for brevity...]"
+        
+        # Keep the prompt minimal
         prompt = (
-            f"I executed the following SQL query to answer the question '{query}':\n\n"
-            f"{sql}\n\n"
-            f"Here are the results:\n{results_for_explanation}\n\n"
-            f"Please provide a brief, clear explanation of these results in plain language. "
-            f"If there were no results returned, explain why that might be the case."
+            f"Question: {query}\n\n"
+            f"SQL: {sql}\n\n"
+            f"Results:\n{results_for_explanation}\n\n"
+            f"Provide a brief explanation of these results."
         )
         
-        # Build conversation for OpenAI
+        # Build minimal conversation for OpenAI, using the dedicated explanation system prompt
         openai_messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": self.explanation_system_prompt},
             {"role": "user", "content": prompt}
         ]
         
-        # Send to OpenAI
+        # Send to OpenAI with minimal token settings
         completion_params = {
             "messages": openai_messages,
-            "max_tokens": 1000,
+            "max_tokens": 500,  # Reduced from 1000
             "temperature": 0.1,
             "model": os.getenv("AZURE_OPENAI_DEPLOYMENT_ID")
         }
@@ -450,6 +560,9 @@ Schema retrieval encountered errors. Limited table information available:
         try:
             completion = client.chat.completions.create(**completion_params)
             explanation = completion.choices[0].message.content
+            
+            # Cache the explanation
+            self.response_cache[cache_key] = explanation
             
             print("\n===== RESULT EXPLANATION =====")
             print(explanation)
