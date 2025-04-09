@@ -7,10 +7,15 @@ This application lets you interact with a specific SQL Server table using natura
 ## Key Features:
 
 * **Talk to Your Table**: Chat with a specific SQL Server table using plain English
+* **SQL Query Iteration**: Provide feedback to refine SQL queries until they meet your needs
+* **Beautiful Tabular Results**: View query results in well-formatted tables for better readability
+* **Query History Logging**: Automatically save queries, iterations, and results for future reference
 * **No-Code Table Operations**: Query, insert, update, and delete data through natural conversations
 * **Secure, Limited Access**: Connect to only one table with restricted credentials for enhanced security
 * **MCP-Enhanced Accuracy**: Achieve precise table interactions through Modal Context Protocol
 * **Context-Aware Conversations**: Maintain context across multiple queries
+* **Natural Language Explanations**: Get plain English explanations of query results
+* **Token Optimization**: Smart caching and context management to minimize API usage
 
 ## What is MCP?
 MCP (Modal Context Protocol) is a methodology that standardizes how context is bound to LLMs, providing a standard way to connect AI models to different data sources and tools.
@@ -23,6 +28,20 @@ This application runs in "Single Table Mode" which provides several advantages:
 2. **Simpler Permissions**: Users need minimal permissions (just for the specific table)
 3. **Focused Experience**: The assistant is specialized for working with just one table
 4. **Reduced Risk**: Prevents accidental access to sensitive data in other tables
+
+## Token Optimization
+
+This application implements several strategies to minimize token usage and prevent rate limiting:
+
+1. **Smart Schema Summarization**: Instead of sending the entire table schema to the model, a concise summary is created
+2. **Response Caching**: Similar queries and explanations are cached to avoid redundant API calls
+3. **Minimal Prompt Design**: System prompts and user instructions are optimized for brevity
+4. **Conversation Management**: Only recent and relevant messages are included in the context
+5. **Dedicated System Prompts**: Different prompts for different tasks (schema, query generation, explanations)
+6. **Selective Result Transmission**: Large result sets are trimmed before being sent to the model
+7. **Token Parameter Tuning**: Request parameters like max_tokens are set conservatively
+
+These optimizations allow the application to function smoothly even with large tables and complex queries, while staying within API rate limits.
 
 ## Prerequisites
 Before you get started, make sure you have the following:
@@ -83,25 +102,141 @@ Once the script starts, it will prompt you with the table name and available com
 ```
 Table Assistant is ready. You are working with table: dbo.Employees
 Type your questions about the table in natural language, and I'll translate them to SQL.
-Special commands: /diagnose - Run diagnostics, /refresh_schema - Refresh table schema
+Special commands: 
+  /diagnose - Run diagnostics
+  /refresh_schema - Refresh table schema
+  /history - View query history
 
 Enter your Query: Show me all employees with a salary over $50,000
 ```
 
-The assistant will:
-1. Translate your natural language to a SQL query
-2. Show you the query for approval
-3. Execute it after your confirmation
-4. Return and explain the results
+## Interactive Query Workflow
 
-## Diagnostics and Troubleshooting
+The assistant follows an interactive workflow:
 
-The application includes built-in diagnostic tools:
+1. You ask a question in natural language
+2. The assistant generates a SQL query
+3. You can:
+   - Execute the query (e)
+   - Provide feedback to refine it (f)
+   - Cancel (c)
+4. If you provide feedback, the assistant generates an improved query
+5. Once executed, results are displayed in a formatted table
+6. The assistant provides a plain English explanation of the results
+7. A complete log of the query, iterations, and results is automatically saved
 
-- Use `/diagnose` to run comprehensive table access diagnostics
-- Use `/refresh_schema` to refresh the table schema
-- Check the `logs` directory for detailed log files
-- Review permissions if you encounter access issues
+### Example Conversation
+
+```
+Enter your Query: Show me the highest paid employee in each department
+
+===== GENERATED SQL QUERY =====
+SELECT 
+    Department,
+    EmployeeName,
+    Salary
+FROM (
+    SELECT 
+        Department,
+        EmployeeName,
+        Salary,
+        ROW_NUMBER() OVER (PARTITION BY Department ORDER BY Salary DESC) as RankBySalary
+    FROM dbo.Employees
+) RankedEmployees
+WHERE RankBySalary = 1
+ORDER BY Department
+===============================
+
+Do you want to (e)xecute this query, provide (f)eedback to refine it, or (c)ancel? (e/f/c): f
+Enter your feedback for improving the SQL query: Include the employee's hire date as well
+
+SQL query generated (iteration 2).
+
+===== GENERATED SQL QUERY =====
+SELECT 
+    Department,
+    EmployeeName,
+    Salary,
+    HireDate
+FROM (
+    SELECT 
+        Department,
+        EmployeeName,
+        Salary,
+        HireDate,
+        ROW_NUMBER() OVER (PARTITION BY Department ORDER BY Salary DESC) as RankBySalary
+    FROM dbo.Employees
+) RankedEmployees
+WHERE RankBySalary = 1
+ORDER BY Department
+===============================
+
+Do you want to (e)xecute this query, provide (f)eedback to refine it, or (c)ancel? (e/f/c): e
+
+===== QUERY RESULTS =====
+Query executed successfully. 5 rows returned.
+
++------------+---------------+----------+------------+
+| Department | EmployeeName  |   Salary | HireDate   |
++============+===============+==========+============+
+| Finance    | Jane Smith    | 95000.00 | 2018-03-15 |
+| HR         | Tim Johnson   | 75000.00 | 2020-01-10 |
+| IT         | Mary Williams | 98000.00 | 2017-05-22 |
+| Marketing  | Bob Miller    | 82000.00 | 2019-07-08 |
+| Sales      | John Davis    | 92000.00 | 2016-11-14 |
++------------+---------------+----------+------------+
+==========================
+
+Query log saved successfully to logs/queries/query_20230901_152412.json
+
+===== RESULT EXPLANATION =====
+The results show the highest paid employee in each department along with their hire date. There are 5 departments in total:
+
+- In Finance, Jane Smith has the highest salary at $95,000 and was hired on March 15, 2018.
+- In HR, Tim Johnson earns the most at $75,000 and joined on January 10, 2020.
+- In IT, Mary Williams is the top earner with $98,000 and has been with the company since May 22, 2017.
+- In Marketing, Bob Miller makes $82,000 and started on July 8, 2019.
+- In Sales, John Davis has the highest salary at $92,000 and was hired on November 14, 2016.
+
+Mary Williams from IT has the highest overall salary among all the top-earning employees across departments.
+==============================
+```
+
+## Diagnostics and Special Commands
+
+The application includes several special commands:
+
+- `/diagnose` - Run comprehensive table access diagnostics
+- `/refresh_schema` - Refresh the table schema
+- `/history` - View a list of all queries executed in the current session
+
+### Query History
+
+The query history feature helps you keep track of all queries executed during the session:
+
+```
+===== QUERY HISTORY =====
+1. [2023-09-01 15:24:12] Show me all employees with a salary over $50,000
+   SQL: SELECT EmployeeName, Department, Salary FROM dbo.Employees WHERE Salary > 50000 ORDER...
+   Iterations: 1, Success: True
+
+2. [2023-09-01 15:32:45] Show me the highest paid employee in each department
+   SQL: SELECT Department, EmployeeName, Salary, HireDate FROM (SELECT Department, EmployeeName...
+   Iterations: 2, Success: True
+=======================
+```
+
+## Query Logging
+
+All queries and results are automatically saved to `logs/queries/` as JSON files for future reference. Each log includes:
+
+- The original natural language query
+- All SQL iterations and feedback
+- The final SQL query that was executed
+- Query results
+- Timestamps
+
+This allows you to track how queries evolve over time and maintain a record of all database interactions.
 
 ## Security Considerations
 
@@ -111,6 +246,7 @@ This application implements several security features:
 2. **Query validation**: All SQL queries are shown for user approval before execution
 3. **Transaction safety**: INSERT/UPDATE/DELETE tests use transactions with rollback
 4. **Error tracing**: Detailed error logs help diagnose issues without exposing sensitive information
+5. **SQL injection prevention**: Structured query generation reduces the risk of SQL injection
 
 ## Connection Issues
 
@@ -121,6 +257,16 @@ If you encounter connection issues:
 3. Check firewall settings to allow SQL Server traffic
 4. Verify that the ODBC driver specified in your .env file is installed
 5. Test connectivity with other tools like SSMS or sqlcmd
+
+## Troubleshooting Token Usage
+
+If you encounter rate limit errors with Azure OpenAI:
+
+1. **Wait before retrying**: Rate limits are usually time-based, so waiting 60 seconds may resolve the issue
+2. **Increase your quota**: Visit https://aka.ms/oai/quotaincrease to request a higher rate limit
+3. **Upgrade your tier**: Free accounts may need to upgrade to Pay-as-you-Go
+4. **Use the /refresh_schema command**: This regenerates the schema summary which might reduce token usage
+5. **Check your prompt length**: Very complex questions might trigger more token usage
 
 ## License
 
