@@ -2,9 +2,12 @@ import os
 import pyodbc
 from loguru import logger
 import sys
+import json
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
 from datetime import datetime
+import tabulate
+import re
 
 load_dotenv()
 
@@ -34,7 +37,7 @@ MSSQL_SERVER = os.getenv("MSSQL_SERVER", "localhost")
 MSSQL_DATABASE = os.getenv("MSSQL_DATABASE", "my_database")
 MSSQL_USERNAME = os.getenv("MSSQL_USERNAME", "sa")
 MSSQL_PASSWORD = os.getenv("MSSQL_PASSWORD", "your_password")
-MSSQL_DRIVER = os.getenv("MSSQL_DRIVER", "{ODBC Driver 17 for SQL Server}")
+MSSQL_DRIVER = os.getenv("MSSQL_DRIVER", "{ODBC Driver 18 for SQL Server}")
 
 # Table configuration
 MSSQL_TABLE_SCHEMA = os.getenv("MSSQL_TABLE_SCHEMA", "dbo")
@@ -62,7 +65,7 @@ mcp = FastMCP("Demo")
 
 @mcp.tool()
 def get_table_schema() -> str:
-    """Retrieve schema information for the specific table."""
+    """Retrieve detailed schema information for the specific table."""
     logger.info(f"Retrieving schema information for table {FULLY_QUALIFIED_TABLE_NAME}...")
     try:
         # Log connection attempt
@@ -75,11 +78,17 @@ def get_table_schema() -> str:
         schema_info = []
         schema_info.append(f"Table: {FULLY_QUALIFIED_TABLE_NAME}")
         
-        # Get columns for the table
+        # Get columns for the table with comprehensive details
         try:
             logger.debug(f"Querying columns for {FULLY_QUALIFIED_TABLE_NAME}")
             cursor.execute(f"""
-                SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
+                SELECT 
+                    COLUMN_NAME, 
+                    DATA_TYPE, 
+                    CHARACTER_MAXIMUM_LENGTH, 
+                    IS_NULLABLE,
+                    COLUMNPROPERTY(OBJECT_ID(CONCAT(TABLE_SCHEMA, '.', TABLE_NAME)), COLUMN_NAME, 'IsIdentity') AS IS_IDENTITY,
+                    COLUMN_DEFAULT
                 FROM INFORMATION_SCHEMA.COLUMNS
                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
                 ORDER BY ORDINAL_POSITION
@@ -92,15 +101,21 @@ def get_table_schema() -> str:
                 logger.warning(f"No columns found for table {FULLY_QUALIFIED_TABLE_NAME}")
                 return f"No columns found for table {FULLY_QUALIFIED_TABLE_NAME}. Please check if the table exists and you have access to it."
             
+            schema_info.append("\nColumn Details:")
             column_details = []
-            for col_name, data_type, max_length, is_nullable in columns:
+            for col_name, data_type, max_length, is_nullable, is_identity, default_val in columns:
                 nullable_str = "NULL" if is_nullable == 'YES' else "NOT NULL"
-                if max_length:
-                    column_details.append(f"{col_name} {data_type}({max_length}) {nullable_str}")
+                identity_str = " IDENTITY" if is_identity == 1 else ""
+                default_str = f" DEFAULT {default_val}" if default_val else ""
+                
+                if max_length and max_length != -1:
+                    column_details.append(f"- {col_name}: {data_type}({max_length}) {nullable_str}{identity_str}{default_str}")
+                elif data_type in ('varchar', 'nvarchar', 'char', 'nchar') and max_length == -1:
+                    column_details.append(f"- {col_name}: {data_type}(MAX) {nullable_str}{identity_str}{default_str}")
                 else:
-                    column_details.append(f"{col_name} {data_type} {nullable_str}")
+                    column_details.append(f"- {col_name}: {data_type} {nullable_str}{identity_str}{default_str}")
             
-            schema_info.append("Columns: " + ", ".join(column_details))
+            schema_info.extend(column_details)
         except Exception as e:
             error_msg = f"Error retrieving columns for {FULLY_QUALIFIED_TABLE_NAME}: {str(e)}"
             logger.error(error_msg)
@@ -122,29 +137,127 @@ def get_table_schema() -> str:
             pk_columns = [row[0] for row in cursor.fetchall()]
             if pk_columns:
                 logger.debug(f"Found primary keys for {FULLY_QUALIFIED_TABLE_NAME}: {', '.join(pk_columns)}")
-                schema_info.append(f"Primary Key: {', '.join(pk_columns)}")
+                schema_info.append(f"\nPrimary Key: {', '.join(pk_columns)}")
             else:
                 logger.debug(f"No primary keys found for {FULLY_QUALIFIED_TABLE_NAME}")
+                schema_info.append("\nPrimary Key: None defined")
         except Exception as e:
             error_msg = f"Error getting primary keys for {FULLY_QUALIFIED_TABLE_NAME}: {str(e)}"
             logger.error(error_msg)
         
-        # Add a sample query
-        schema_info.append(f"Sample Select Query: SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}")
-        schema_info.append(f"Sample Count Query: SELECT COUNT(*) FROM {FULLY_QUALIFIED_TABLE_NAME}")
+        # Get foreign keys
+        try:
+            logger.debug(f"Querying foreign keys for {FULLY_QUALIFIED_TABLE_NAME}")
+            cursor.execute(f"""
+                SELECT 
+                    fk.name AS FK_NAME,
+                    OBJECT_NAME(fk.parent_object_id) AS TABLE_NAME,
+                    COL_NAME(fkc.parent_object_id, fkc.parent_column_id) AS COLUMN_NAME,
+                    OBJECT_NAME(fk.referenced_object_id) AS REFERENCED_TABLE_NAME,
+                    COL_NAME(fkc.referenced_object_id, fkc.referenced_column_id) AS REFERENCED_COLUMN_NAME
+                FROM 
+                    sys.foreign_keys AS fk
+                INNER JOIN 
+                    sys.foreign_key_columns AS fkc ON fk.OBJECT_ID = fkc.constraint_object_id
+                INNER JOIN 
+                    sys.tables AS t ON t.OBJECT_ID = fk.parent_object_id
+                INNER JOIN 
+                    sys.schemas AS s ON s.schema_id = t.schema_id
+                WHERE 
+                    s.name = ? AND t.name = ?
+            """, (MSSQL_TABLE_SCHEMA, MSSQL_TABLE_NAME))
+            
+            fk_results = cursor.fetchall()
+            if fk_results:
+                schema_info.append("\nForeign Keys:")
+                for fk_name, _, column, ref_table, ref_column in fk_results:
+                    schema_info.append(f"- {column} -> {ref_table}.{ref_column} (FK: {fk_name})")
+            else:
+                schema_info.append("\nForeign Keys: None defined")
+        except Exception as e:
+            error_msg = f"Error getting foreign keys: {str(e)}"
+            logger.error(error_msg)
+        
+        # Get indexes
+        try:
+            logger.debug(f"Querying indexes for {FULLY_QUALIFIED_TABLE_NAME}")
+            cursor.execute(f"""
+                SELECT 
+                    i.name AS INDEX_NAME,
+                    i.type_desc AS INDEX_TYPE,
+                    STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS COLUMN_NAMES,
+                    i.is_unique
+                FROM 
+                    sys.indexes i
+                INNER JOIN 
+                    sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+                INNER JOIN 
+                    sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                INNER JOIN 
+                    sys.tables t ON i.object_id = t.object_id
+                INNER JOIN 
+                    sys.schemas s ON t.schema_id = s.schema_id
+                WHERE 
+                    s.name = ? AND t.name = ? AND i.name IS NOT NULL
+                GROUP BY 
+                    i.name, i.type_desc, i.is_unique
+            """, (MSSQL_TABLE_SCHEMA, MSSQL_TABLE_NAME))
+            
+            idx_results = cursor.fetchall()
+            if idx_results:
+                schema_info.append("\nIndexes:")
+                for idx_name, idx_type, columns, is_unique in idx_results:
+                    unique_str = "UNIQUE " if is_unique else ""
+                    schema_info.append(f"- {idx_name}: {unique_str}{idx_type} on ({columns})")
+            else:
+                schema_info.append("\nIndexes: None defined (except for primary key)")
+        except Exception as e:
+            error_msg = f"Error getting indexes: {str(e)}"
+            logger.error(error_msg)
+        
+        # Get table statistics
+        try:
+            cursor.execute(f"SELECT COUNT(*) FROM {FULLY_QUALIFIED_TABLE_NAME}")
+            row_count = cursor.fetchone()[0]
+            schema_info.append(f"\nApproximate Row Count: {row_count}")
+        except Exception as e:
+            logger.warning(f"Could not retrieve row count: {str(e)}")
+            schema_info.append("\nRow Count: Unable to retrieve")
+            
+        # Add sample queries
+        schema_info.append(f"\nSample Queries:")
+        schema_info.append(f"- SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}")
+        schema_info.append(f"- SELECT COUNT(*) FROM {FULLY_QUALIFIED_TABLE_NAME}")
+        
+        # If primary key exists, add a sample query using it
+        if pk_columns:
+            pk_conditions = " AND ".join([f"{pk} = @value" for pk in pk_columns])
+            schema_info.append(f"- SELECT * FROM {FULLY_QUALIFIED_TABLE_NAME} WHERE {pk_conditions}")
         
         # Add sample data if available
         try:
-            cursor.execute(f"SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}")
+            cursor.execute(f"SELECT TOP 3 * FROM {FULLY_QUALIFIED_TABLE_NAME}")
             sample_rows = cursor.fetchall()
             
             if sample_rows and cursor.description:
                 column_names = [column[0] for column in cursor.description]
-                schema_info.append("\nSample Data:")
-                schema_info.append(f"Columns: {', '.join(column_names)}")
                 
-                for i, row in enumerate(sample_rows):
-                    schema_info.append(f"Row {i+1}: {str(row)}")
+                schema_info.append("\nSample Data Preview:")
+                headers = column_names
+                table_data = []
+                
+                for row in sample_rows:
+                    # Convert row to list for tabulate
+                    processed_row = []
+                    for item in row:
+                        if isinstance(item, (datetime, bytes, bytearray)):
+                            processed_row.append(str(item))
+                        else:
+                            processed_row.append(item)
+                    table_data.append(processed_row)
+                
+                table_str = tabulate.tabulate(table_data, headers=headers, tablefmt="grid")
+                schema_info.append(table_str)
         except Exception as e:
             logger.warning(f"Could not retrieve sample data: {str(e)}")
         
@@ -174,9 +287,18 @@ Please check your connection settings in the .env file and ensure you have acces
             logger.debug("Closing database connection")
             conn.close()
 
+def is_select_query(sql):
+    """Check if a query is a SELECT statement (read-only)"""
+    # Remove comments and normalize whitespace
+    sql = re.sub(r'--.*?(\n|$)|/\*.*?\*/', ' ', sql, flags=re.DOTALL)
+    sql = ' '.join(sql.split()).strip().upper()
+    
+    # Check if it starts with SELECT
+    return sql.startswith('SELECT')
+
 @mcp.tool()
 def query_table(sql: str) -> str:
-    """Execute SQL queries on the specific table."""
+    """Execute SQL queries on the specific table and return results in tabular format."""
     logger.info(f"Processing query for table {FULLY_QUALIFIED_TABLE_NAME}...")
     
     # Security check: ensure query only accesses the allowed table
@@ -197,14 +319,64 @@ def query_table(sql: str) -> str:
         cursor = conn.cursor()
         cursor.execute(sql)
         
+        # For SELECT queries, format results as tabular data
         if cursor.description is not None:
-            result = cursor.fetchall()
-            output = "\n".join(str(row) for row in result)
+            results = cursor.fetchall()
+            
+            if not results:
+                if is_select_query(sql):
+                    return "Query executed successfully, but no rows were returned."
+                else:
+                    return "SQL executed successfully, no results to display."
+            
+            # Get column names from cursor description
+            headers = [column[0] for column in cursor.description]
+            
+            # Process row data (handle datetime, bytes, etc.)
+            rows = []
+            for row in results:
+                processed_row = []
+                for item in row:
+                    if isinstance(item, (datetime, bytes, bytearray)):
+                        processed_row.append(str(item))
+                    else:
+                        processed_row.append(item)
+                rows.append(processed_row)
+            
+            # Create tabular output using tabulate
+            table = tabulate.tabulate(rows, headers=headers, tablefmt="grid")
+            
+            # Also prepare JSON for possible programmatic use
+            json_data = []
+            for row in rows:
+                json_row = {}
+                for i, header in enumerate(headers):
+                    json_row[header] = row[i]
+                json_data.append(json_row)
+            
+            # Return both formats
+            result = {
+                "tabular": table,
+                "json": json_data,
+                "row_count": len(rows),
+                "columns": headers
+            }
+            
+            # Return combined output that's both human-readable and machine-parseable
+            output = f"Query executed successfully. {len(rows)} rows returned.\n\n{table}\n\n"
+            output += "JSON_DATA:" + json.dumps(json_data)
+            
+            return output
         else:
-            output = "SQL executed successfully, no results returned."
-        
-        conn.commit() 
-        return output
+            # For non-SELECT queries
+            row_count = cursor.rowcount
+            if row_count >= 0:
+                output = f"SQL executed successfully. {row_count} rows affected."
+            else:
+                output = "SQL executed successfully."
+            
+            conn.commit()
+            return output
     except Exception as e:
         logger.error(f"Error executing query: {str(e)}", exc_info=True)
         return f"Error: {str(e)}"
@@ -248,188 +420,211 @@ def get_table_info() -> str:
             
             table_exists = cursor.fetchone()[0] > 0
             if table_exists:
-                info.append("Status: Table exists and is accessible")
+                info.append("Table exists: Yes")
             else:
-                info.append("Status: Table does not exist or is not accessible to this user")
+                info.append("Table exists: No - Table not found in INFORMATION_SCHEMA.TABLES")
         except Exception as e:
             logger.error(f"Error verifying table existence: {e}")
-            info.append("Status: Unable to verify table existence")
+            info.append("Table exists: Unable to verify")
         
         return "\n".join(info)
     except Exception as e:
-        logger.error(f"Error retrieving basic table info: {e}", exc_info=True)
-        return f"Failed to retrieve basic table information: {str(e)}"
+        logger.error(f"Error getting basic table info: {str(e)}", exc_info=True)
+        return f"Error retrieving basic table information: {str(e)}"
     finally:
         if 'conn' in locals():
             conn.close()
 
 @mcp.tool()
 def diagnose_table_access() -> str:
-    """Run diagnostics on table access."""
-    logger.info(f"Running table access diagnostics for {FULLY_QUALIFIED_TABLE_NAME}...")
+    """Run diagnostics to test connection and permissions on the table."""
+    logger.info(f"Running diagnostics for table {FULLY_QUALIFIED_TABLE_NAME}...")
     results = []
-    results.append(f"=== SQL Server Table Access Diagnostics for {FULLY_QUALIFIED_TABLE_NAME} ===")
     
-    # Test basic connectivity
-    results.append("\n1. Testing database connectivity:")
-    try:
-        conn = pyodbc.connect(connection_string, timeout=5)
-        results.append("✓ Successfully connected to the database server")
-        conn.close()
-    except Exception as e:
-        results.append(f"✗ Connection failed: {str(e)}")
-        logger.error(f"Connection diagnostic failed: {e}", exc_info=True)
-        results.append("\nCannot proceed with further diagnostics due to connection failure.")
-        return "\n".join(results)
-    
-    # Test table existence
-    results.append("\n2. Testing table existence:")
+    # Test database connection
     try:
         conn = pyodbc.connect(connection_string)
         cursor = conn.cursor()
+        results.append("✅ Database connection: Success")
         
-        cursor.execute("""
-            SELECT COUNT(*) 
-            FROM INFORMATION_SCHEMA.TABLES 
-            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-        """, (MSSQL_TABLE_SCHEMA, MSSQL_TABLE_NAME))
-        
-        table_exists = cursor.fetchone()[0] > 0
-        if table_exists:
-            results.append(f"✓ Table {FULLY_QUALIFIED_TABLE_NAME} exists")
-        else:
-            results.append(f"✗ Table {FULLY_QUALIFIED_TABLE_NAME} does not exist")
-            results.append("\nCannot proceed with further diagnostics as table does not exist.")
-            conn.close()
+        # Test table existence
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) 
+                FROM INFORMATION_SCHEMA.TABLES 
+                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+            """, (MSSQL_TABLE_SCHEMA, MSSQL_TABLE_NAME))
+            
+            table_exists = cursor.fetchone()[0] > 0
+            if table_exists:
+                results.append(f"✅ Table exists: {FULLY_QUALIFIED_TABLE_NAME} found")
+            else:
+                results.append(f"❌ Table missing: {FULLY_QUALIFIED_TABLE_NAME} not found in INFORMATION_SCHEMA.TABLES")
+                results.append("   ↳ Check if table name and schema are correct")
+                results.append("   ↳ Verify user has permission to see the table metadata")
+                return "\n".join(results)
+        except Exception as e:
+            results.append(f"❌ Table check failed: {str(e)}")
             return "\n".join(results)
-        
-        conn.close()
-    except Exception as e:
-        results.append(f"✗ Table existence check failed: {str(e)}")
-        logger.error(f"Table existence check failed: {e}", exc_info=True)
-        results.append("\nCannot proceed with further diagnostics due to error.")
-        return "\n".join(results)
-    
-    # Test table permissions
-    results.append("\n3. Testing table permissions:")
-    try:
-        conn = pyodbc.connect(connection_string)
-        cursor = conn.cursor()
         
         # Test SELECT permission
         try:
             cursor.execute(f"SELECT TOP 1 * FROM {FULLY_QUALIFIED_TABLE_NAME}")
-            cursor.fetchone()
-            results.append("✓ User has SELECT permission")
+            cursor.fetchone()  # Just to test if it works
+            results.append("✅ SELECT permission: Granted")
         except Exception as e:
-            results.append(f"✗ User does not have SELECT permission: {str(e)}")
+            results.append(f"❌ SELECT permission: Denied - {str(e)}")
         
-        # Test INSERT permission (using a transaction that we'll roll back)
+        # Test other permissions (with transaction to avoid actual changes)
+        cursor.execute("BEGIN TRANSACTION")
+        
         try:
-            # Start a transaction
-            cursor.execute("BEGIN TRANSACTION")
-            
-            # Get column info for INSERT test
+            # Detect primary key for WHERE clause
             cursor.execute(f"""
-                SELECT COLUMN_NAME, DATA_TYPE
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-                AND IS_NULLABLE = 'YES'
-                ORDER BY ORDINAL_POSITION
+                SELECT c.COLUMN_NAME, DATA_TYPE
+                FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE c ON c.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+                JOIN INFORMATION_SCHEMA.COLUMNS col ON c.COLUMN_NAME = col.COLUMN_NAME 
+                    AND col.TABLE_SCHEMA = tc.TABLE_SCHEMA AND col.TABLE_NAME = tc.TABLE_NAME
+                WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' 
+                    AND tc.TABLE_SCHEMA = ? 
+                    AND tc.TABLE_NAME = ?
             """, (MSSQL_TABLE_SCHEMA, MSSQL_TABLE_NAME))
             
-            nullable_columns = cursor.fetchall()
-            if not nullable_columns:
-                results.append("✗ Could not test INSERT permission: No nullable columns found")
-            else:
-                # Build a test INSERT with NULL values
-                col_names = ", ".join([f"[{col[0]}]" for col in nullable_columns])
-                null_values = ", ".join(["NULL" for _ in nullable_columns])
+            pk_info = cursor.fetchone()
+            
+            # If no PK, get first column for tests
+            if not pk_info:
+                cursor.execute(f"""
+                    SELECT TOP 1 COLUMN_NAME, DATA_TYPE
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+                    ORDER BY ORDINAL_POSITION
+                """, (MSSQL_TABLE_SCHEMA, MSSQL_TABLE_NAME))
+                pk_info = cursor.fetchone()
+            
+            if pk_info:
+                column_name, data_type = pk_info
                 
-                try:
-                    insert_sql = f"INSERT INTO {FULLY_QUALIFIED_TABLE_NAME} ({col_names}) VALUES ({null_values})"
-                    cursor.execute(insert_sql)
-                    results.append("✓ User has INSERT permission")
-                except Exception as e:
-                    results.append(f"✗ User does not have INSERT permission: {str(e)}")
+                # Use appropriate literal format based on data type
+                safe_where = f"1=0"  # Never true condition to avoid affecting data
                 
-            # Roll back the transaction
-            cursor.execute("ROLLBACK TRANSACTION")
-        except Exception as e:
-            results.append(f"✗ INSERT permission test failed: {str(e)}")
-            # Make sure we roll back
-            try:
-                cursor.execute("ROLLBACK TRANSACTION")
-            except:
-                pass
-        
-        # Test UPDATE permission (in a transaction)
-        try:
-            # Start a transaction
-            cursor.execute("BEGIN TRANSACTION")
-            
-            # Get a column for UPDATE test
-            cursor.execute(f"""
-                SELECT TOP 1 COLUMN_NAME
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-                AND IS_NULLABLE = 'YES'
-                ORDER BY ORDINAL_POSITION
-            """, (MSSQL_TABLE_SCHEMA, MSSQL_TABLE_NAME))
-            
-            result = cursor.fetchone()
-            if not result:
-                results.append("✗ Could not test UPDATE permission: No suitable columns found")
-            else:
-                column_name = result[0]
+                # Test UPDATE permission (will rollback)
                 try:
-                    # Test UPDATE with a condition that won't match anything
-                    update_sql = f"UPDATE {FULLY_QUALIFIED_TABLE_NAME} SET [{column_name}] = NULL WHERE 1 = 0"
-                    cursor.execute(update_sql)
-                    results.append("✓ User has UPDATE permission")
+                    if data_type in ('varchar', 'nvarchar', 'char', 'nchar'):
+                        test_sql = f"UPDATE {FULLY_QUALIFIED_TABLE_NAME} SET {column_name} = {column_name} WHERE {safe_where}"
+                    else:
+                        test_sql = f"UPDATE {FULLY_QUALIFIED_TABLE_NAME} SET {column_name} = {column_name} WHERE {safe_where}"
+                    
+                    cursor.execute(test_sql)
+                    results.append("✅ UPDATE permission: Granted")
                 except Exception as e:
-                    results.append(f"✗ User does not have UPDATE permission: {str(e)}")
-            
-            # Roll back the transaction
-            cursor.execute("ROLLBACK TRANSACTION")
+                    results.append(f"❌ UPDATE permission: Denied - {str(e)}")
+                
+                # Test DELETE permission (will rollback)
+                try:
+                    cursor.execute(f"DELETE FROM {FULLY_QUALIFIED_TABLE_NAME} WHERE {safe_where}")
+                    results.append("✅ DELETE permission: Granted")
+                except Exception as e:
+                    results.append(f"❌ DELETE permission: Denied - {str(e)}")
+                
+                # Test INSERT permission (will rollback)
+                try:
+                    columns = []
+                    cursor.execute(f"""
+                        SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+                        FROM INFORMATION_SCHEMA.COLUMNS 
+                        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+                        ORDER BY ORDINAL_POSITION
+                    """, (MSSQL_TABLE_SCHEMA, MSSQL_TABLE_NAME))
+                    
+                    # Build a safe INSERT that will fail on constraints but test permissions
+                    column_list = []
+                    value_list = []
+                    
+                    for col_name, data_type, is_nullable in cursor.fetchall():
+                        if is_nullable == 'YES':
+                            column_list.append(col_name)
+                            value_list.append('NULL')
+                            
+                    if column_list:
+                        insert_sql = f"INSERT INTO {FULLY_QUALIFIED_TABLE_NAME} ({', '.join(column_list)}) VALUES ({', '.join(value_list)})"
+                        try:
+                            cursor.execute(insert_sql)
+                            results.append("✅ INSERT permission: Granted")
+                        except Exception as e:
+                            # Check if it's a constraint error (which means permission was granted)
+                            if "constraint" in str(e).lower() or "null" in str(e).lower():
+                                results.append("✅ INSERT permission: Granted (failed due to constraints)")
+                            else:
+                                results.append(f"❌ INSERT permission: Denied - {str(e)}")
+                    else:
+                        results.append("⚠️ INSERT permission: Could not test (no nullable columns found)")
+                except Exception as e:
+                    results.append(f"❌ INSERT permission: Test error - {str(e)}")
+            else:
+                results.append("⚠️ Permissions tests: Limited (no suitable columns found)")
         except Exception as e:
-            results.append(f"✗ UPDATE permission test failed: {str(e)}")
-            # Make sure we roll back
-            try:
-                cursor.execute("ROLLBACK TRANSACTION")
-            except:
-                pass
-        
-        # Test DELETE permission (in a transaction)
-        try:
-            # Start a transaction
-            cursor.execute("BEGIN TRANSACTION")
-            
-            try:
-                # Test DELETE with a condition that won't match anything
-                delete_sql = f"DELETE FROM {FULLY_QUALIFIED_TABLE_NAME} WHERE 1 = 0"
-                cursor.execute(delete_sql)
-                results.append("✓ User has DELETE permission")
-            except Exception as e:
-                results.append(f"✗ User does not have DELETE permission: {str(e)}")
-            
-            # Roll back the transaction
+            results.append(f"❌ Permissions tests error: {str(e)}")
+        finally:
+            # Always rollback the transaction
             cursor.execute("ROLLBACK TRANSACTION")
-        except Exception as e:
-            results.append(f"✗ DELETE permission test failed: {str(e)}")
-            # Make sure we roll back
-            try:
-                cursor.execute("ROLLBACK TRANSACTION")
-            except:
-                pass
+            results.append("ℹ️ All test changes were rolled back")
         
-        conn.close()
+        return "\n".join(results)
     except Exception as e:
-        results.append(f"✗ Permission testing failed: {str(e)}")
-    
-    logger.info("Table access diagnostics completed")
-    return "\n".join(results)
+        results.append(f"❌ Database connection failed: {str(e)}")
+        return "\n".join(results)
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
+@mcp.tool()
+def save_query_log(natural_language_query: str, sql_query: str, result_summary: str, iterations: list) -> str:
+    """Save the query details, iterations, and results to a log file."""
+    logger.info(f"Saving query log for: {natural_language_query[:50]}...")
+    
+    try:
+        log_dir = "logs/queries"
+        os.makedirs(log_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = os.path.join(log_dir, f"query_{timestamp}.json")
+        
+        # Extract row count and first few rows from result summary
+        result_info = {
+            "success": not result_summary.startswith("Error"),
+            "summary": result_summary.split("\n\nJSON_DATA:")[0] if "JSON_DATA:" in result_summary else result_summary
+        }
+        
+        # Extract JSON data if available
+        if "JSON_DATA:" in result_summary:
+            json_str = result_summary.split("JSON_DATA:")[1]
+            try:
+                result_info["data"] = json.loads(json_str)
+            except:
+                result_info["data"] = "JSON parsing failed"
+        
+        # Create log entry
+        log_entry = {
+            "timestamp": timestamp,
+            "natural_language_query": natural_language_query,
+            "final_sql_query": sql_query,
+            "result": result_info,
+            "iterations": iterations
+        }
+        
+        # Write to file
+        with open(log_file, 'w') as f:
+            json.dump(log_entry, f, indent=2, default=str)
+        
+        logger.info(f"Query log saved to {log_file}")
+        return f"Query log saved successfully to {log_file}"
+    except Exception as e:
+        logger.error(f"Error saving query log: {str(e)}", exc_info=True)
+        return f"Error saving query log: {str(e)}"
+
+# Run our server
 if __name__ == "__main__":
-    print("Starting server...")
-    mcp.run(transport="stdio")
+    logger.info("MCP SQL Server is starting up")
+    mcp.run()
