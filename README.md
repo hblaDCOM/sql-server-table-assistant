@@ -1,62 +1,44 @@
-# SQL Server Agent - Modal Context Protocol
-Here is the SQL Server Agent that let's you Interact with the SQL Server Database in the Natural Language leveraging the Modal Context Protocol as a layer between our LLMs and Data Source.
+# SQL Server Table Assistant - Modal Context Protocol
+
+This application lets you interact with a specific SQL Server table using natural language, leveraging the Modal Context Protocol as a communication layer between LLMs and your data source.
+
+*This project is based on the [mcp-sql-server-natural-lang](https://github.com/Amanp17/mcp-sql-server-natural-lang) repository by [Aman Pachori](https://github.com/Amanp17), with modifications to focus on single table access.*
 
 ## Key Features:
 
-* **Talk to Your Database**: Chat with SQL Server using plain English.
-* **No-Code Database Operations**: Manage your database tasks entirely through natural conversations.
-* **One-Click Procedure Execution**: Run stored procedures effortlessly with natural commands.
-* **MCP-Enhanced Accuracy**: Achieve precise database interactions through Modal Context Protocol (MCP), intelligently connecting your commands to data.
-* **Context-Aware Conversations**: Enjoy seamless interactions powered by Modal Context Protocol.
+* **Talk to Your Table**: Chat with a specific SQL Server table using plain English
+* **No-Code Table Operations**: Query, insert, update, and delete data through natural conversations
+* **Secure, Limited Access**: Connect to only one table with restricted credentials for enhanced security
+* **MCP-Enhanced Accuracy**: Achieve precise table interactions through Modal Context Protocol
+* **Context-Aware Conversations**: Maintain context across multiple queries
 
 ## What is MCP?
-MCP (Modal Context Protocol) is a metodology that stats how we should bind the context to the LLMs.
-MCP provides a standardized way to connect AI models to different data sources and tools.
+MCP (Modal Context Protocol) is a methodology that standardizes how context is bound to LLMs, providing a standard way to connect AI models to different data sources and tools.
 
-## Why MCP?
-MCP helps us to build the complex workflows in a simplified way to build the Agents on top of LLMs where the laguage models needs a frequent integration with the data sources and tools.
+## Single Table Mode
 
-## MCP Architecture:
-The MCP architecture follows a client-server model, allowing a single client to interact seamlessly with multiple servers.
+This application runs in "Single Table Mode" which provides several advantages:
 
-![MCP Architecture](assets/MCPArchitecture.png)
-
-
-**MCP-Client**: Your AI client (LLM) accessing data.
-
-**MCP-Protocol**: Connects your client directly to the server.
-
-**MCP-Server**: Helps your client access data sources via MCP.
-
-**Local Database, Cloud Database, External APIs**: Sources providing data through local storage, cloud, or online APIs.
-
-## Now, Let's Dive Into the Implementation
-With an understanding of MCP and its architecture, it's time to bring it all together with the **SQL Server Agent**.
-
-### What is SQL Server Agent?
-The **SQL Server Agent** is a conversational AI Query CLI that enables you to **interact with your SQL Server Database using natural language**. Powered by the **Modal Context Protocol**, it acts as a smart layer between your language model and the database, making it possible to:
-
-- Query your database without writing SQL
-- Execute stored procedures with conversational commands
-- Perform complex operations while maintaining context across multiple steps
-
-Whether you're a developer, analyst, or non-technical user, this agent makes your data accessible through intuitive, human-like interactions.
-
-Now, let’s walk through how to get it up and running 👇
+1. **Enhanced Security**: Access is limited to a single table rather than the entire database
+2. **Simpler Permissions**: Users need minimal permissions (just for the specific table)
+3. **Focused Experience**: The assistant is specialized for working with just one table
+4. **Reduced Risk**: Prevents accidental access to sensitive data in other tables
 
 ## Prerequisites
 Before you get started, make sure you have the following:
 
 - **Python 3.12+** installed on your machine  
-- A valid **OpenAI API Key**
+- A valid **Azure OpenAI deployment** with API access
+- **SQL Server** with a table that you want to interact with
+- **Limited user credentials** with access to only that table
 
 ## Getting Started
 Follow these steps to get the project up and running:
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/Amanp17/mcp-sql-server-natural-lang.git
-cd mcp-sql-server-natural-lang
+git clone https://github.com/yourusername/sql-server-table-assistant.git
+cd sql-server-table-assistant
 ```
 
 ### 2. Install Dependencies
@@ -68,44 +50,83 @@ pip install -r requirements.txt
 Create a `.env` file in the root of the project and add the following:
 
 ```dotenv
-OPENAI_API_KEY=your_openai_api_key
+# Azure OpenAI Configuration (required)
+AZURE_OPENAI_API_KEY=your_azure_openai_api_key
+AZURE_OPENAI_ENDPOINT=https://your-resource-name.openai.azure.com
+AZURE_OPENAI_API_VERSION=2023-05-15
+AZURE_OPENAI_DEPLOYMENT_ID=your-deployment-name
+
+# SQL Server Configuration
 MSSQL_SERVER=localhost
 MSSQL_DATABASE=your_database_name
 MSSQL_USERNAME=your_username
 MSSQL_PASSWORD=your_password
-MSSQL_DRIVER={ODBC Driver 17 for SQL Server}
+MSSQL_DRIVER={ODBC Driver 18 for SQL Server}
+
+# Table Configuration
+MSSQL_TABLE_SCHEMA=dbo
+MSSQL_TABLE_NAME=your_table_name
 ```
 
-## Running the SQL Server Agent
-Once you've set up your environment and dependencies, you're ready to interact with the SQL Server Agent.
+## Running the Table Assistant
+Once you've set up your environment and dependencies, you're ready to interact with the Table Assistant.
 
 ### Run the Client Script
-Execute the following command to start the agent:
+Execute the following command to start the assistant:
 
 ```bash
 python mcp-ssms-client.py
 ```
 
-Once the script starts, it will prompt you like this:
+Once the script starts, it will prompt you with the table name and available commands. You can then type your requests in plain English. For example:
 
-```bash
-Enter your Query:
+```
+Table Assistant is ready. You are working with table: dbo.Employees
+Type your questions about the table in natural language, and I'll translate them to SQL.
+Special commands: /diagnose - Run diagnostics, /refresh_schema - Refresh table schema
+
+Enter your Query: Show me all employees with a salary over $50,000
 ```
 
-Now, you can type your request in plain English. For example:
+The assistant will:
+1. Translate your natural language to a SQL query
+2. Show you the query for approval
+3. Execute it after your confirmation
+4. Return and explain the results
 
-```swift
-Create a Employee table with 10 dummy data in it with their departments and salaries.
-```
+## Diagnostics and Troubleshooting
 
-The agent will process your input using the Modal Context Protocol and return the relevant data from your SQL Server database.
+The application includes built-in diagnostic tools:
 
-🧠 Tip: You can ask follow-up questions or make requests like "show me the employees and their departments?" or "how many employees are having salary under $40K?" — the context is preserved!
+- Use `/diagnose` to run comprehensive table access diagnostics
+- Use `/refresh_schema` to refresh the table schema
+- Check the `logs` directory for detailed log files
+- Review permissions if you encounter access issues
 
-## Conclusion
+## Security Considerations
 
-The **SQL Server Agent** powered by the **Modal Context Protocol (MCP)** brings the power of conversational AI to your database operations. By bridging the gap between natural language and SQL, it allows users to interact with their data effortlessly, making database access more intuitive, efficient, and accessible to everyone even those without technical expertise.
+This application implements several security features:
 
-Whether you're querying data, executing procedures, or building complex workflows, this agent serves as your intelligent interface to SQL Server.
+1. **Single table access**: Queries are restricted to the configured table
+2. **Query validation**: All SQL queries are shown for user approval before execution
+3. **Transaction safety**: INSERT/UPDATE/DELETE tests use transactions with rollback
+4. **Error tracing**: Detailed error logs help diagnose issues without exposing sensitive information
 
-Feel free to contribute, open issues, or suggest enhancements — we're building the future of AI-driven data interaction together! 🚀
+## Connection Issues
+
+If you encounter connection issues:
+
+1. Verify your server name or IP address is correct
+2. Ensure the SQL Server is running and accepts remote connections
+3. Check firewall settings to allow SQL Server traffic
+4. Verify that the ODBC driver specified in your .env file is installed
+5. Test connectivity with other tools like SSMS or sqlcmd
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgements
+
+- Original MCP SQL Server Natural Language implementation by [Aman Pachori](https://github.com/Amanp17)
+- Built with [Modal Context Protocol (MCP)](https://github.com/microsoft/mcp)

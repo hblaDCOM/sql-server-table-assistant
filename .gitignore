@@ -1,10 +1,53 @@
-# Byte-compiled / optimized / DLL files
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Include example environment file
+!.env.example
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+logs/
+*.log
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Virtual environments
+venv/
+ENV/
+env/
+.env/
+.venv/
 
 # Distribution / packaging
 .Python
