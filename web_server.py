@@ -47,8 +47,293 @@ def check_ip():
 
 @app.route('/')
 def index():
-    """Serve the main chat interface"""
-    return render_template('index.html')
+    """Render the main page for the SQL Table Assistant."""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQL Table Assistant</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            background-color: #f8f9fa;
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        #chat-container {
+            height: 500px;
+            overflow-y: auto;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            padding: 15px;
+            background-color: white;
+            margin-bottom: 15px;
+        }
+        #output {
+            white-space: pre-wrap;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 14px;
+        }
+        #sql-container {
+            display: none;
+            margin-top: 20px;
+            padding: 15px;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            background-color: #f8f9fa;
+        }
+        #sql-query {
+            font-family: 'Consolas', 'Courier New', monospace;
+            background-color: #282c34;
+            color: #abb2bf;
+            padding: 10px;
+            border-radius: 5px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+        }
+        #action-buttons {
+            display: none;
+            margin-top: 15px;
+        }
+        .btn-toolbar {
+            margin-bottom: 15px;
+        }
+        #feedback-container {
+            display: none;
+            margin-top: 15px;
+        }
+        .system-message {
+            color: #6c757d;
+            font-style: italic;
+        }
+        .user-message {
+            color: #007bff;
+            font-weight: bold;
+        }
+        .response {
+            color: #28a745;
+        }
+        .error-message {
+            color: #dc3545;
+        }
+        .header {
+            background-color: #343a40;
+            color: white;
+            padding: 20px 0;
+            margin-bottom: 20px;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 24px;
+        }
+        .loader {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(0,0,0,.1);
+            border-radius: 50%;
+            border-top-color: #007bff;
+            animation: spin 1s ease-in-out infinite;
+            margin-left: 10px;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="container">
+            <h1>SQL Table Assistant</h1>
+        </div>
+    </div>
+    <div class="container">
+        <div id="chat-container">
+            <div id="output"></div>
+        </div>
+        
+        <div id="sql-container" class="mb-4">
+            <h4>Generated SQL Query</h4>
+            <pre id="sql-query"></pre>
+            <div id="action-buttons">
+                <button id="execute-btn" class="btn btn-success me-2">Execute Query</button>
+                <button id="refine-btn" class="btn btn-primary me-2">Refine Query</button>
+                <button id="cancel-btn" class="btn btn-secondary">Cancel</button>
+            </div>
+            <div id="feedback-container" class="mt-3">
+                <textarea id="feedback-text" class="form-control mb-2" rows="3" placeholder="Enter your feedback to improve the SQL query..."></textarea>
+                <button id="submit-feedback-btn" class="btn btn-primary">Submit Feedback</button>
+                <button id="cancel-feedback-btn" class="btn btn-secondary ms-2">Cancel</button>
+            </div>
+        </div>
+        
+        <div class="input-group">
+            <input type="text" id="query-input" class="form-control" placeholder="Ask a question about your data...">
+            <button id="send-btn" class="btn btn-primary">Send</button>
+        </div>
+        <div class="mt-2">
+            <small class="text-muted">Try special commands: /diagnose, /refresh_schema, /history, /show-logs</small>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.socket.io/4.4.1/socket.io.min.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const output = document.getElementById('output');
+            const queryInput = document.getElementById('query-input');
+            const sendBtn = document.getElementById('send-btn');
+            const sqlContainer = document.getElementById('sql-container');
+            const sqlQuery = document.getElementById('sql-query');
+            const actionButtons = document.getElementById('action-buttons');
+            const executeBtn = document.getElementById('execute-btn');
+            const refineBtn = document.getElementById('refine-btn');
+            const cancelBtn = document.getElementById('cancel-btn');
+            const feedbackContainer = document.getElementById('feedback-container');
+            const feedbackText = document.getElementById('feedback-text');
+            const submitFeedbackBtn = document.getElementById('submit-feedback-btn');
+            const cancelFeedbackBtn = document.getElementById('cancel-feedback-btn');
+            
+            let processing = false;
+            let waitingForDecision = false;
+            
+            // Connect to the server
+            const socket = io();
+            
+            // Add a message to the output container
+            function addMessage(text, type = 'system') {
+                const className = type === 'user' ? 'user-message' : 
+                                 type === 'response' ? 'response' : 
+                                 type === 'error' ? 'error-message' : 'system-message';
+                
+                output.innerHTML += `<div class="${className}">${text}</div>`;
+                output.scrollTop = output.scrollHeight;
+            }
+            
+            // Set up event listeners
+            sendBtn.addEventListener('click', sendQuery);
+            queryInput.addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    sendQuery();
+                }
+            });
+            
+            executeBtn.addEventListener('click', function() {
+                sendAction('e');
+            });
+            
+            refineBtn.addEventListener('click', function() {
+                actionButtons.style.display = 'none';
+                feedbackContainer.style.display = 'block';
+                feedbackText.focus();
+            });
+            
+            cancelBtn.addEventListener('click', function() {
+                sendAction('c');
+            });
+            
+            submitFeedbackBtn.addEventListener('click', function() {
+                const feedback = feedbackText.value.trim();
+                if (feedback) {
+                    sendAction('f', feedback);
+                    feedbackContainer.style.display = 'none';
+                    feedbackText.value = '';
+                } else {
+                    alert('Please enter feedback to improve the query.');
+                }
+            });
+            
+            cancelFeedbackBtn.addEventListener('click', function() {
+                feedbackContainer.style.display = 'none';
+                actionButtons.style.display = 'block';
+                feedbackText.value = '';
+            });
+            
+            // Function to send a query to the server
+            function sendQuery() {
+                const query = queryInput.value.trim();
+                if (query && !processing && !waitingForDecision) {
+                    processing = true;
+                    addMessage(`> ${query}`, 'user');
+                    socket.emit('query', { query: query });
+                    queryInput.value = '';
+                    
+                    // Hide SQL container when sending a new query
+                    sqlContainer.style.display = 'none';
+                    actionButtons.style.display = 'none';
+                    feedbackContainer.style.display = 'none';
+                    waitingForDecision = false;
+                }
+            }
+            
+            // Function to send an action (execute, refine, cancel)
+            function sendAction(action, feedback = '') {
+                if (waitingForDecision) {
+                    waitingForDecision = false;
+                    sqlContainer.style.display = 'none';
+                    actionButtons.style.display = 'none';
+                    feedbackContainer.style.display = 'none';
+                    
+                    let actionName = action === 'e' ? 'Execute' : 
+                                    action === 'f' ? 'Refine' : 'Cancel';
+                    addMessage(`> Selected: ${actionName}`, 'user');
+                    
+                    if (action === 'f' && feedback) {
+                        addMessage(`> Feedback: ${feedback}`, 'user');
+                    }
+                    
+                    socket.emit('action', { 
+                        action: action,
+                        feedback: feedback
+                    });
+                }
+            }
+            
+            // Socket.io event handlers
+            socket.on('connect', function() {
+                addMessage('Connected to SQL Table Assistant. Initializing...');
+            });
+            
+            socket.on('disconnect', function() {
+                addMessage('Disconnected from server. Please refresh the page.', 'error');
+                processing = false;
+            });
+            
+            socket.on('response', function(data) {
+                addMessage(data.text, 'response');
+                processing = false;
+            });
+            
+            socket.on('sql_generated', function(data) {
+                sqlQuery.textContent = data.sql;
+                sqlContainer.style.display = 'block';
+                actionButtons.style.display = 'block';
+                waitingForDecision = true;
+            });
+            
+            socket.on('waiting_for_decision', function() {
+                waitingForDecision = true;
+                sqlContainer.style.display = 'block';
+                actionButtons.style.display = 'block';
+            });
+            
+            socket.on('query_executed', function() {
+                waitingForDecision = false;
+            });
+        });
+    </script>
+</body>
+</html>
+    """
 
 @socketio.on('connect')
 def handle_connect():
@@ -100,10 +385,56 @@ def handle_query(data):
         cleanup_session(uid)
         start_client_process(uid, request.sid)
     
+    # Store the current query type
+    active_sessions[uid]['current_action'] = 'query'
+    
     # Run the query
     status = run_client_query(uid, query, request.sid)
     if not status:
         socketio.emit('response', {'text': 'Error processing query. The assistant may need to be restarted.'}, room=request.sid)
+
+@socketio.on('action')
+def handle_action(data):
+    """Handle user actions (execute, refine, cancel) for a generated SQL query"""
+    if 'uid' not in session:
+        socketio.emit('response', {'text': 'Session error. Please refresh the page.'}, room=request.sid)
+        return
+    
+    uid = session['uid']
+    action = data.get('action', '').strip().lower()
+    feedback = data.get('feedback', '').strip()
+    
+    if not action or action not in ['e', 'f', 'c']:
+        socketio.emit('response', {'text': 'Invalid action. Please use execute, refine, or cancel.'}, room=request.sid)
+        return
+    
+    # Check if the client process is running
+    if uid not in active_sessions or not is_process_alive(uid):
+        socketio.emit('response', {'text': 'Session error or process not running. Please refresh the page.'}, room=request.sid)
+        return
+    
+    active_sessions[uid]['current_action'] = action
+    
+    # Handle the action
+    if action == 'e':
+        # Execute query - just send the action
+        socketio.emit('response', {'text': '\nExecuting SQL query...\n'}, room=request.sid)
+        run_client_action(uid, action, request.sid)
+    elif action == 'f':
+        if not feedback:
+            socketio.emit('response', {'text': 'Please provide feedback to refine the query.'}, room=request.sid)
+            return
+        # Refine query with feedback
+        socketio.emit('response', {'text': f'\nRefining SQL query with feedback: {feedback}\n'}, room=request.sid)
+        # First send the action
+        run_client_action(uid, action, request.sid)
+        # Then send the feedback
+        time.sleep(0.5)  # Small delay to ensure action is processed
+        run_client_action(uid, feedback, request.sid)
+    elif action == 'c':
+        # Cancel query
+        socketio.emit('response', {'text': '\nCancelling SQL query.\n'}, room=request.sid)
+        run_client_action(uid, action, request.sid)
 
 def start_client_process(uid, sid):
     """Start a new client process with input/output files for IPC"""
@@ -128,8 +459,15 @@ def start_client_process(uid, sid):
     # Create a background process runner
     def run_process():
         try:
-            # Use a modified version of the mcp-ssms-client.py that uses file I/O instead of stdin/stdout
-            cmd = [sys.executable, "mcp-ssms-client-file.py", input_path, output_path]
+            # Command to run the client script
+            cmd = [
+                sys.executable,  # Python executable
+                "./mcp-ssms-client-file.py",  # Client script
+                input_path,      # Input file path as first argument
+                output_path      # Output file path as second argument
+            ]
+            
+            print(f"Starting process with command: {' '.join(cmd)}")
             
             # Start the process
             process = subprocess.Popen(
@@ -160,16 +498,22 @@ def start_client_process(uid, sid):
                     socketio.emit('response', {'text': 'SQL Table Assistant is ready for your queries.\n'}, room=sid)
             
             # Process completed
-            print(f"Client process for session {uid} exited with code {process.returncode}")
+            process_status = process.poll()
+            print(f"Process {uid} exited with status: {process_status}")
             
-            # Check if process terminated abnormally
-            if process.returncode != 0 and uid in active_sessions:
-                socketio.emit('response', {'text': f"The assistant process exited unexpectedly. Please refresh the page."}, room=sid)
-        
-        except Exception as e:
-            print(f"Error in client process: {e}")
+            # Mark session as inactive
             if uid in active_sessions:
-                socketio.emit('response', {'text': f"Error in assistant process: {str(e)}"}, room=sid)
+                active_sessions[uid]['active'] = False
+                
+            socketio.emit('response', {'text': 'SQL Table Assistant process has ended. Please refresh the page to restart.\n'}, room=sid)
+            
+        except Exception as e:
+            print(f"Error running client process: {e}")
+            socketio.emit('response', {'text': f"Error running SQL Assistant: {str(e)}\n"}, room=sid)
+            
+            # Mark session as inactive
+            if uid in active_sessions:
+                active_sessions[uid]['active'] = False
     
     # Create a thread to monitor the output file
     def monitor_output():
@@ -180,6 +524,11 @@ def start_client_process(uid, sid):
         start_time = time.time()
         last_content_time = time.time()  # Track when we last received content
         initial_output_seen = False
+        
+        # State tracking for SQL query flow
+        waiting_for_decision = False
+        sql_generated = False
+        sql_query = ""
         
         # Initialize the output file with empty content
         try:
@@ -216,7 +565,7 @@ def start_client_process(uid, sid):
                     
                     # Clean up and restart
                     cleanup_session(uid)
-                    start_client_process(uid, request.sid)
+                    start_client_process(uid, sid)
                     return  # Exit this monitor thread
                 
                 # Check if output file exists
@@ -259,6 +608,38 @@ def start_client_process(uid, sid):
                     # Add new content to buffer
                     buffer.append(new_content)
                     last_check_time = current_time
+                    
+                    # Check for special markers in the content
+                    content_to_check = ''.join(buffer)
+                    
+                    # Check if SQL has been generated
+                    if "===== GENERATED SQL QUERY =====" in content_to_check:
+                        sql_generated = True
+                        # Extract the SQL query
+                        try:
+                            sql_start = content_to_check.find("===== GENERATED SQL QUERY =====") + len("===== GENERATED SQL QUERY =====")
+                            sql_end = content_to_check.find("===============================", sql_start)
+                            if sql_end > sql_start:
+                                sql_query = content_to_check[sql_start:sql_end].strip()
+                                print(f"Extracted SQL query: {sql_query}")
+                                # Emit a special event with the SQL query
+                                socketio.emit('sql_generated', {
+                                    'sql': sql_query,
+                                    'iteration': 1  # Default to 1, could extract from content
+                                }, room=sid)
+                        except Exception as sql_err:
+                            print(f"Error extracting SQL query: {sql_err}")
+                    
+                    # Check if waiting for user decision
+                    if "(e)xecute" in content_to_check and "(f)eedback" in content_to_check and "(c)ancel" in content_to_check:
+                        waiting_for_decision = True
+                        # Emit a special event to indicate waiting for decision
+                        socketio.emit('waiting_for_decision', {}, room=sid)
+                    
+                    # Check for query results
+                    if "===== QUERY RESULTS =====" in content_to_check:
+                        # Emit a special event with the results
+                        socketio.emit('query_executed', {}, room=sid)
                     
                     # Flush buffer to client if it contains substantial content or after a delay
                     if len(''.join(buffer)) > 30 or current_time - last_flush_time > 0.3:
@@ -321,10 +702,11 @@ def start_client_process(uid, sid):
     
     # Store session data
     active_sessions[uid] = {
-        'process': None,
+        'active': True,
         'input_path': input_path,
         'output_path': output_path,
-        'active': True,
+        'current_action': None,
+        'process': None,
         'sid': sid
     }
     
@@ -439,6 +821,33 @@ def run_client_query(uid, query, sid):
         error_msg = f"Error writing query to input file: {str(e)}"
         print(error_msg)
         socketio.emit('response', {'text': f"Error: {error_msg}\n"}, room=sid)
+        return False
+
+def run_client_action(uid, action, sid):
+    """Send an action command to the client process via the input file"""
+    if uid not in active_sessions or not active_sessions[uid]['active']:
+        print(f"Session {uid} is not active")
+        return False
+    
+    session_data = active_sessions[uid]
+    input_path = session_data['input_path']
+    
+    try:
+        # Check if process is still alive
+        if not is_process_alive(uid):
+            print(f"Client process for session {uid} is not running")
+            return False
+            
+        # Write action to input file with newline
+        print(f"Writing action '{action}' to input file for session {uid}")
+        with open(input_path, 'w') as f:
+            f.write(action + '\n')
+            f.flush()
+            os.fsync(f.fileno())  # Force write to disk
+        
+        return True
+    except Exception as e:
+        print(f"Error writing action to input file: {e}")
         return False
 
 def cleanup_session(uid):
