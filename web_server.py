@@ -11,9 +11,13 @@ from flask import Flask, render_template, request, jsonify, session
 from flask_socketio import SocketIO
 from flask_cors import CORS
 from dotenv import load_dotenv
+import logging
 
 # Load environment variables
 load_dotenv()
+
+# Temp directory for IPC files
+TEMP_DIR = os.path.join(tempfile.gettempdir(), "sql_assistant")
 
 # Create Flask app
 app = Flask(__name__, 
@@ -54,7 +58,14 @@ def handle_connect():
     
     # Generate a unique session ID
     session['uid'] = os.urandom(16).hex()
-    print(f"Client connected: {session['uid']}")
+    uid = session['uid']
+    print(f"Client connected: {uid}")
+    
+    # Start a new client process immediately
+    if uid not in active_sessions:
+        start_client_process(uid, request.sid)
+        # Send initial greeting to client
+        socketio.emit('response', {'text': 'Initializing the SQL Table Assistant...\n'}, room=request.sid)
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -77,8 +88,15 @@ def handle_query(data):
     if not query:
         return
     
-    # Start a new client process if not already running
+    # Check if the client process is running
     if uid not in active_sessions:
+        # Process not started yet (should not happen normally since we start on connect)
+        socketio.emit('response', {'text': 'Initializing the SQL Table Assistant...\n'}, room=request.sid)
+        start_client_process(uid, request.sid)
+    elif not is_process_alive(uid):
+        # Process died, restart it
+        socketio.emit('response', {'text': 'Restarting the SQL Table Assistant...\n'}, room=request.sid)
+        cleanup_session(uid)
         start_client_process(uid, request.sid)
     
     # Run the query
@@ -118,9 +136,21 @@ def start_client_process(uid, sid):
             # Update session data with process info
             active_sessions[uid]['process'] = process
             
+            # Notify user that process has started
+            socketio.emit('response', {'text': 'SQL Table Assistant process started. Initializing...\n'}, room=sid)
+            
             # Monitor process stdout for debugging
             for line in iter(process.stdout.readline, ''):
-                print(f"Process output [{uid}]: {line.strip()}")
+                line_text = line.strip()
+                print(f"Process output [{uid}]: {line_text}")
+                
+                # Send progress updates for key initialization steps
+                if "Fetching schema" in line_text:
+                    socketio.emit('response', {'text': 'Retrieving your table schema...\n'}, room=sid)
+                elif "Schema information fetched successfully" in line_text:
+                    socketio.emit('response', {'text': 'Schema retrieved successfully!\n'}, room=sid)
+                elif "Table Assistant is ready" in line_text:
+                    socketio.emit('response', {'text': 'SQL Table Assistant is ready for your queries.\n'}, room=sid)
             
             # Process completed
             print(f"Client process for session {uid} exited with code {process.returncode}")
@@ -139,31 +169,95 @@ def start_client_process(uid, sid):
         last_position = 0
         buffer = []
         last_flush_time = time.time()
+        last_check_time = time.time()
+        start_time = time.time()
+        initial_output_seen = False
+        
+        # Initialize the output file with empty content
+        try:
+            with open(output_path, 'w') as f:
+                f.write("")
+        except Exception as e:
+            print(f"Error initializing output file: {e}")
+        
+        # Give the client process more time to start and print its initial output
+        # This helps ensure we capture the schema fetching and welcome message
+        time.sleep(4)
         
         while uid in active_sessions and active_sessions[uid]['active']:
             try:
+                current_time = time.time()
+                
                 # Check if output file exists
                 if not os.path.exists(output_path):
                     time.sleep(0.5)
                     continue
                 
                 # Read new content from output file
-                with open(output_path, 'r') as f:
-                    f.seek(last_position)
-                    new_content = f.read()
-                    last_position = f.tell()
+                try:
+                    with open(output_path, 'r', encoding='utf-8') as f:
+                        # Get file size
+                        f.seek(0, os.SEEK_END)
+                        file_size = f.tell()
+                        
+                        if file_size < last_position:
+                            # File was truncated
+                            last_position = 0
+                        
+                        # If this is initial startup and file has content, read from beginning
+                        if not initial_output_seen and file_size > 0:
+                            f.seek(0)
+                        else:
+                            # Go to last position
+                            f.seek(last_position)
+                            
+                        new_content = f.read()
+                        last_position = f.tell()
+                except Exception as read_error:
+                    print(f"Error reading output file: {read_error}")
+                    time.sleep(1)
+                    continue
                 
+                # Process only if we have new content
                 if new_content:
+                    # Mark that we've seen some output
+                    initial_output_seen = True
+                    
+                    print(f"Read new content from output file: {len(new_content)} bytes")
                     # Add new content to buffer
                     buffer.append(new_content)
+                    last_check_time = current_time
                     
                     # Flush buffer to client if it contains substantial content or after a delay
-                    current_time = time.time()
-                    if len(''.join(buffer)) > 100 or current_time - last_flush_time > 0.5:
+                    if len(''.join(buffer)) > 30 or current_time - last_flush_time > 0.3:
                         content = ''.join(buffer)
                         socketio.emit('response', {'text': content}, room=sid)
+                        print(f"Sent {len(content)} characters to client")
                         buffer = []
                         last_flush_time = current_time
+                else:
+                    # Special handling for startup - if no content after 15 seconds, show a message
+                    if not initial_output_seen and current_time - start_time > 15:
+                        msg = "SQL Table Assistant is taking longer than expected to start. Please wait...\n"
+                        socketio.emit('response', {'text': msg}, room=sid)
+                        initial_output_seen = True  # Mark as seen to avoid repeat messages
+                    
+                    # No new content, check if we should flush buffer due to time
+                    if buffer and current_time - last_flush_time > 1.0:
+                        content = ''.join(buffer)
+                        socketio.emit('response', {'text': content}, room=sid)
+                        print(f"Timeout flush: sent {len(content)} characters to client")
+                        buffer = []
+                        last_flush_time = current_time
+                    
+                    # Check if we've had no content for a while - send ping message
+                    if current_time - last_check_time > 10:
+                        print(f"No content for {int(current_time - last_check_time)} seconds, checking if process is alive")
+                        if not is_process_alive(uid):
+                            print(f"Process for session {uid} is no longer alive")
+                            socketio.emit('response', {'text': "The assistant process has stopped. Please refresh the page to restart."}, room=sid)
+                            break
+                        last_check_time = current_time
                 
                 # Small delay to avoid busy waiting
                 time.sleep(0.2)
@@ -176,6 +270,7 @@ def start_client_process(uid, sid):
         if buffer:
             content = ''.join(buffer)
             socketio.emit('response', {'text': content}, room=sid)
+            print(f"Final flush: sent {len(content)} characters to client")
     
     # Store session data
     active_sessions[uid] = {
@@ -197,7 +292,14 @@ def start_client_process(uid, sid):
     monitor_thread.start()
     
     # Wait for process to initialize
-    time.sleep(2)
+    print(f"Waiting for client process {uid} to initialize")
+    time.sleep(3)  # Increased wait time
+    
+    # Log that the process started successfully
+    if is_process_alive(uid):
+        print(f"Client process {uid} started successfully")
+    else:
+        print(f"Warning: Client process {uid} may not have started properly")
     
     return True
 
@@ -248,6 +350,73 @@ def cleanup_session(uid):
         
         # Remove session data
         del active_sessions[uid]
+
+def is_process_alive(session_id):
+    """Check if a process for a given session is still alive."""
+    if session_id not in active_sessions or 'process' not in active_sessions[session_id]:
+        return False
+        
+    process = active_sessions[session_id]['process']
+    if process is None:
+        return False
+        
+    # Check if process is still running
+    return process.poll() is None
+
+def read_assistant_output(uid, ws):
+    """Read assistant output file and send contents to client."""
+    output_file = os.path.join(TEMP_DIR, f'output_{uid}.txt')
+    
+    # Initialize the file with empty content to avoid reading errors
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write('')
+    
+    # Give the client process a moment to start
+    time.sleep(1)
+    
+    buffer = []
+    last_flush_time = time.time()
+    last_position = 0
+    
+    while True:
+        if not is_process_alive(uid):
+            # Process has ended, send any remaining output
+            if buffer:
+                ws.send(json.dumps({"type": "assistant", "content": ''.join(buffer)}))
+            ws.send(json.dumps({"type": "status", "content": "Assistant process has ended"}))
+            break
+            
+        try:
+            with open(output_file, 'r', encoding='utf-8') as f:
+                # Check if the file has been truncated
+                file_size = os.path.getsize(output_file)
+                if file_size < last_position:
+                    # File was truncated, reset position
+                    last_position = 0
+                    
+                f.seek(last_position)
+                new_content = f.read()
+                
+                if new_content:
+                    buffer.append(new_content)
+                    last_position = f.tell()
+                    
+                    # Flush if enough content or enough time has passed
+                    current_time = time.time()
+                    if len(''.join(buffer)) > 100 or (current_time - last_flush_time) > 0.5:
+                        ws.send(json.dumps({"type": "assistant", "content": ''.join(buffer)}))
+                        buffer = []
+                        last_flush_time = current_time
+                        
+        except Exception as e:
+            logging.error(f"Error reading output file: {e}")
+                
+        # Small delay to prevent high CPU usage
+        time.sleep(0.1)
+    
+    # Final flush of any remaining content
+    if buffer:
+        ws.send(json.dumps({"type": "assistant", "content": ''.join(buffer)}))
 
 if __name__ == '__main__':
     # Check if we need to create the file-based client script
@@ -302,11 +471,15 @@ def output_print(*args, **kwargs):
         message = " ".join(str(arg) for arg in args)
         with open(OUTPUT_FILE_PATH, 'a') as f:
             f.write(message + "\\n")
+            f.flush()  # Make sure it's written immediately
     except Exception as e:
         original_print(f"Error writing to output file: {e}")
 
 # Replace the print function
 print = output_print
+
+# Print a startup marker to indicate the process has started
+print("==== SQL Table Assistant Initializing ====")
 """
             
             # Add the custom code right after the imports

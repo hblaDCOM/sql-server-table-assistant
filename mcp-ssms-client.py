@@ -246,7 +246,7 @@ Schema retrieval encountered errors. Limited table information available:
             self.system_prompt = self.system_prompt.replace("{table_name}", FULLY_QUALIFIED_TABLE_NAME)
 
     def extract_sql_from_assistant_reply(self, assistant_reply: str) -> Optional[Dict[str, Any]]:
-        """Extract SQL query from assistant reply using multiple methods."""
+        """Extract SQL query from the assistant's reply."""
         # Try the TOOL format first
         if "TOOL:" in assistant_reply:
             try:
