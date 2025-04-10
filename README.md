@@ -199,8 +199,7 @@ The results show the highest paid employee in each department along with their h
 - In Sales, John Davis has the highest salary at $92,000 and was hired on November 14, 2016.
 
 Mary Williams from IT has the highest overall salary among all the top-earning employees across departments.
-==============================
-```
+==============================```
 
 ## Diagnostics and Special Commands
 
@@ -276,3 +275,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 - Original MCP SQL Server Natural Language implementation by [Aman Pachori](https://github.com/Amanp17)
 - Built with [Modal Context Protocol (MCP)](https://github.com/microsoft/mcp)
+

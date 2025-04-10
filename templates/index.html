@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQL Server Table Assistant</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+    <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="header">
+            <h1>SQL Server Table Assistant</h1>
+            <div class="connection-status">
+                <span id="status-indicator"></span>
+                <span id="status-text">Connecting...</span>
+            </div>
+        </div>
+        
+        <div class="chat-messages" id="chat-messages">
+            <div class="message system">
+                <p>Welcome to the SQL Server Table Assistant. Type your natural language question about the table below.</p>
+            </div>
+        </div>
+        
+        <div class="chat-input">
+            <input type="text" id="user-input" placeholder="Ask a question about your data...">
+            <button id="send-button">Send</button>
+        </div>
+        
+        <div class="special-commands">
+            <p>Special commands:</p>
+            <ul>
+                <li><code>/diagnose</code> - Run diagnostics</li>
+                <li><code>/refresh_schema</code> - Refresh table schema</li>
+                <li><code>/history</code> - View query history</li>
+                <li><code>/show-logs [n]</code> - View recent query logs</li>
+            </ul>
+        </div>
+    </div>
+    
+    <script src="/static/js/app.js"></script>
+</body>
+</html> 
