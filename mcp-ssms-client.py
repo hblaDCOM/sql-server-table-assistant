@@ -245,51 +245,49 @@ Schema retrieval encountered errors. Limited table information available:
             self.system_prompt = self.system_prompt.replace("{schema_summary}", self.schema_summary)
             self.system_prompt = self.system_prompt.replace("{table_name}", FULLY_QUALIFIED_TABLE_NAME)
 
-    def extract_sql_from_assistant_reply(self, assistant_reply: str) -> Optional[Dict[str, Any]]:
-        """Extract SQL query from the assistant's reply."""
-        # Try the TOOL format first
-        if "TOOL:" in assistant_reply:
-            try:
-                pattern = r"TOOL:\s*(\w+),\s*ARGS:\s*(\{.*\})"
-                match = re.search(pattern, assistant_reply)
-                if match:
-                    tool_name = match.group(1)
-                    tool_args_str = match.group(2)
-                    
-                    try:
-                        tool_args = json.loads(tool_args_str)
-                        return {"tool_name": tool_name, "args": tool_args}
-                    except json.JSONDecodeError as json_err:
-                        # Try to extract SQL directly as fallback
-                        sql_pattern = r'"sql":\s*"(.+?)"'
-                        sql_match = re.search(sql_pattern, tool_args_str)
-                        if sql_match:
-                            sql = sql_match.group(1)
-                            return {"tool_name": tool_name, "args": {"sql": sql}}
-            except Exception:
-                pass
+    def extract_sql_from_assistant_reply(self, assistant_reply: str) -> dict:
+        """Extract SQL from the assistant's reply, handling multiple formats."""
+        # First check for the TOOL format
+        tool_pattern = r"TOOL:\s*(\w+),\s*ARGS:\s*(\{.*\})"
+        tool_matches = re.search(tool_pattern, assistant_reply, re.DOTALL)
         
-        # Try SQL code block extraction as fallback
-        sql_pattern = r'```sql\s*(.*?)\s*```'
-        sql_match = re.search(sql_pattern, assistant_reply, re.DOTALL)
-        if sql_match:
-            sql = sql_match.group(1).strip()
+        if tool_matches:
+            try:
+                tool_name = tool_matches.group(1)
+                args_str = tool_matches.group(2)
+                # Try to parse the args as JSON
+                args = json.loads(args_str)
+                return {"tool_name": tool_name, "args": args}
+            except json.JSONDecodeError:
+                pass  # Fall through to other extraction methods
+        
+        # Check for code blocks with SQL
+        sql_code_block_pattern = r"```sql\s*(.*?)\s*```"
+        sql_matches = re.search(sql_code_block_pattern, assistant_reply, re.DOTALL)
+        
+        if sql_matches:
+            sql = sql_matches.group(1).strip()
             return {"tool_name": "query_table", "args": {"sql": sql}}
         
-        # Try direct SQL extraction (for cases where model outputs just the SQL)
-        if re.search(r'\bSELECT\b', assistant_reply, re.IGNORECASE) and \
-           re.search(r'\bFROM\b', assistant_reply, re.IGNORECASE):
-            # Extract what looks like a SQL query
-            lines = assistant_reply.split('\n')
-            sql_lines = []
-            for line in lines:
-                if re.search(r'\b(SELECT|FROM|WHERE|ORDER BY|GROUP BY|HAVING|JOIN)\b', line, re.IGNORECASE):
-                    sql_lines.append(line)
-            
-            if sql_lines:
-                potential_sql = ' '.join(sql_lines)
+        # Check for generic code blocks that might contain SQL
+        code_block_pattern = r"```\s*(.*?)\s*```"
+        code_matches = re.search(code_block_pattern, assistant_reply, re.DOTALL)
+        
+        if code_matches:
+            potential_sql = code_matches.group(1).strip()
+            # Simple validation that it looks like SQL
+            if re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b", potential_sql, re.IGNORECASE):
                 return {"tool_name": "query_table", "args": {"sql": potential_sql}}
         
+        # Last resort: try to find any SQL-like statement
+        fallback_sql_pattern = r'"sql":\s*"(.+?)"'
+        fallback_matches = re.search(fallback_sql_pattern, assistant_reply, re.DOTALL)
+        
+        if fallback_matches:
+            sql = fallback_matches.group(1).strip()
+            return {"tool_name": "query_table", "args": {"sql": sql}}
+        
+        # If we get here, we couldn't extract SQL
         return None
 
     # Add a custom JSON encoder class to handle special float values
@@ -743,3 +741,58 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Application error: {e}")
         input("Press Enter to exit...")
+
+def get_input():
+    """Get input from the input file."""
+    try:
+        # Debug file existence and size
+        if os.path.exists(INPUT_FILE_PATH):
+            print(f"Input file exists at {INPUT_FILE_PATH}, size: {os.path.getsize(INPUT_FILE_PATH)} bytes")
+        else:
+            print(f"Warning: Input file does not exist at {INPUT_FILE_PATH}")
+            # Try to create it
+            try:
+                with open(INPUT_FILE_PATH, 'w') as f:
+                    pass
+                print(f"Created input file at {INPUT_FILE_PATH}")
+            except Exception as e:
+                print(f"Error creating input file: {e}")
+                
+        # Debug empty file
+        with open(INPUT_FILE_PATH, 'r') as f:
+            content = f.read().strip()
+            
+        if content:
+            print(f"Found content in input file: {content[:50]}...")
+            
+            # Handle special messages
+            if content == "__HEARTBEAT__":
+                print("Received heartbeat")
+                # Clear the input file
+                with open(INPUT_FILE_PATH, 'w') as f:
+                    pass
+                return None
+                
+            # Handle probe messages
+            if content == "__PROBE__":
+                print("Received probe, replying with status")
+                # Clear the input file
+                with open(INPUT_FILE_PATH, 'w') as f:
+                    pass
+                # Write status to output file
+                with open(OUTPUT_FILE_PATH, 'a') as f:
+                    f.write("[STATUS] MCP client is responsive and waiting for input\n")
+                    f.flush()
+                return None
+                
+            # Clear the input file
+            with open(INPUT_FILE_PATH, 'w') as f:
+                pass
+                
+            return content
+        else:
+            print("Input file is empty")
+            return None
+    except Exception as e:
+        print(f"Error reading input file: {e}")
+        return None

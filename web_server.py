@@ -178,6 +178,7 @@ def start_client_process(uid, sid):
         last_flush_time = time.time()
         last_check_time = time.time()
         start_time = time.time()
+        last_content_time = time.time()  # Track when we last received content
         initial_output_seen = False
         
         # Initialize the output file with empty content
@@ -194,6 +195,29 @@ def start_client_process(uid, sid):
         while uid in active_sessions and active_sessions[uid]['active']:
             try:
                 current_time = time.time()
+                
+                # Check if the process has been unresponsive for too long (2 minutes)
+                if current_time - last_content_time > 120:
+                    print(f"Process {uid} appears to be unresponsive (no output for {int(current_time - last_content_time)} seconds)")
+                    # Try to restart the process
+                    with open(output_path, 'a') as f:
+                        f.write("\n[SYSTEM] The process appears to be unresponsive. Attempting to restart...\n")
+                        f.flush()
+                    
+                    socketio.emit('response', {'text': "\nThe SQL Assistant appears to be stuck. Attempting to restart...\n"}, room=sid)
+                    
+                    # Check if we can kill the process
+                    if is_process_alive(uid):
+                        try:
+                            active_sessions[uid]['process'].terminate()
+                            print(f"Terminated unresponsive process {uid}")
+                        except Exception as term_err:
+                            print(f"Error terminating process: {term_err}")
+                    
+                    # Clean up and restart
+                    cleanup_session(uid)
+                    start_client_process(uid, request.sid)
+                    return  # Exit this monitor thread
                 
                 # Check if output file exists
                 if not os.path.exists(output_path):
@@ -229,6 +253,7 @@ def start_client_process(uid, sid):
                 if new_content:
                     # Mark that we've seen some output
                     initial_output_seen = True
+                    last_content_time = current_time  # Update the last content time
                     
                     print(f"Read new content from output file: {len(new_content)} bytes")
                     # Add new content to buffer
@@ -264,6 +289,21 @@ def start_client_process(uid, sid):
                             print(f"Process for session {uid} is no longer alive")
                             socketio.emit('response', {'text': "The assistant process has stopped. Please refresh the page to restart."}, room=sid)
                             break
+                        
+                        # Check if input file is empty, if so, send a probe message
+                        try:
+                            if os.path.exists(input_path):
+                                with open(input_path, 'r') as f:
+                                    content = f.read().strip()
+                                if not content:
+                                    # Write a probe message
+                                    with open(input_path, 'w') as f:
+                                        f.write("__PROBE__\n")
+                                        f.flush()
+                                    print(f"Sent probe to input file for session {uid}")
+                        except Exception as probe_err:
+                            print(f"Error sending probe: {probe_err}")
+                            
                         last_check_time = current_time
                 
                 # Small delay to avoid busy waiting
@@ -321,14 +361,47 @@ def run_client_query(uid, query, sid):
     
     session_data = active_sessions[uid]
     input_path = session_data['input_path']
+    output_path = session_data['output_path']
     
     try:
         # Check if process is still alive
+        process = session_data.get('process')
+        if process is None:
+            print(f"No process object found for session {uid}")
+            return False
+            
         if not is_process_alive(uid):
             print(f"Client process for session {uid} is not running")
             return False
             
+        # Get process status for debugging
+        returncode = process.poll()
+        print(f"Process status for {uid}: {'Running' if returncode is None else f'Exited with code {returncode}'}")
+        
+        # Check if input file exists
+        if not os.path.exists(input_path):
+            print(f"Input file {input_path} does not exist, attempting to create")
+            try:
+                with open(input_path, 'w') as f:
+                    pass
+            except Exception as create_err:
+                print(f"Failed to create input file: {create_err}")
+                return False
+                
+        # Check if output file exists (for debugging)
+        if not os.path.exists(output_path):
+            print(f"Output file {output_path} doesn't exist, which is unusual")
+            
+        # Write a distinctive marker to the output file
+        try:
+            with open(output_path, 'a') as f:
+                f.write(f"\n[WEB SERVER] About to process query: {query}\n")
+                f.flush()
+        except Exception as marker_err:
+            print(f"Error writing marker to output file: {marker_err}")
+            
         # Write query to input file with newline
+        print(f"Writing query '{query}' to {input_path}")
         with open(input_path, 'w') as f:
             f.write(query + '\n')
             f.flush()  # Make sure it's written immediately
@@ -336,10 +409,13 @@ def run_client_query(uid, query, sid):
         
         # Verify file was written
         try:
+            time.sleep(0.2)  # Small delay to ensure file system sync
             with open(input_path, 'r') as f:
                 content = f.read().strip()
                 if not content:
                     print(f"Warning: Input file appears empty after writing query for session {uid}")
+                else:
+                    print(f"Verified input file contains: {content}")
         except Exception as verify_err:
             print(f"Error verifying input file write: {verify_err}")
         
@@ -348,9 +424,21 @@ def run_client_query(uid, query, sid):
         # Notify user we're processing their query
         socketio.emit('response', {'text': f"\nProcessing: {query}\n"}, room=sid)
         
+        # Wait a moment and check if process is still alive
+        time.sleep(1)
+        if not is_process_alive(uid):
+            print(f"Process {uid} died after sending query")
+            socketio.emit('response', {'text': "The assistant process has stopped unexpectedly. Restarting...\n"}, room=sid)
+            # Restart the process
+            cleanup_session(uid)
+            start_client_process(uid, sid)
+            return False
+            
         return True
     except Exception as e:
-        print(f"Error writing query to input file: {e}")
+        error_msg = f"Error writing query to input file: {str(e)}"
+        print(error_msg)
+        socketio.emit('response', {'text': f"Error: {error_msg}\n"}, room=sid)
         return False
 
 def cleanup_session(uid):
@@ -504,10 +592,37 @@ if __name__ == '__main__':
             # Add file paths as command line arguments
             file_io_code = """
 import sys
+import os
+import time
+
+print("Starting MCP client with file I/O...")
 
 # Get file paths from command line arguments
-INPUT_FILE_PATH = sys.argv[1] if len(sys.argv) > 1 else None
-OUTPUT_FILE_PATH = sys.argv[2] if len(sys.argv) > 2 else None
+if len(sys.argv) < 3:
+    print(f"Error: Expected two file path arguments, got {len(sys.argv)-1}")
+    print(f"Usage: {sys.argv[0]} input_file output_file")
+    sys.exit(1)
+
+INPUT_FILE_PATH = sys.argv[1]
+OUTPUT_FILE_PATH = sys.argv[2]
+
+print(f"Using input file: {INPUT_FILE_PATH}")
+print(f"Using output file: {OUTPUT_FILE_PATH}")
+
+# Verify the files are accessible
+try:
+    with open(INPUT_FILE_PATH, 'w') as f:
+        f.write("")
+    print(f"Successfully opened input file for writing")
+except Exception as e:
+    print(f"Error accessing input file: {e}")
+
+try:
+    with open(OUTPUT_FILE_PATH, 'w') as f:
+        f.write("")
+    print(f"Successfully opened output file for writing")
+except Exception as e:
+    print(f"Error accessing output file: {e}")
 
 # Override the get_input function to read from a file
 def get_input(prompt: str) -> str:
@@ -518,17 +633,37 @@ def get_input(prompt: str) -> str:
     # Write a marker to the output file to indicate we're waiting for input
     try:
         with open(OUTPUT_FILE_PATH, 'a') as f:
-            f.write(f"Waiting for your input: {prompt}\\n")
+            f.write(f"Waiting for input: {prompt}\\n")
             f.flush()
     except Exception as e:
-        original_print(f"Error writing prompt to output file: {e}")
+        print(f"Error writing prompt to output file: {e}")
+    
+    last_check_time = time.time()
+    content = ""
+    attempts = 0
     
     # Wait for input to appear in the file
-    attempts = 0
     while True:
         try:
+            # Debug output every 10 seconds
+            current_time = time.time()
+            if current_time - last_check_time > 10:
+                print(f"Still waiting for input on {INPUT_FILE_PATH}...")
+                with open(OUTPUT_FILE_PATH, 'a') as f:
+                    f.write(f"Still waiting for input...\\n")
+                    f.flush()
+                last_check_time = current_time
+                
             # Check if the input file exists
             if not os.path.exists(INPUT_FILE_PATH):
+                print(f"Input file {INPUT_FILE_PATH} does not exist, waiting...")
+                time.sleep(1)
+                continue
+                
+            # Check file size
+            file_size = os.path.getsize(INPUT_FILE_PATH)
+            if file_size == 0:
+                # Empty file, no input yet
                 time.sleep(0.5)
                 continue
                 
@@ -547,6 +682,20 @@ def get_input(prompt: str) -> str:
                     time.sleep(0.1)
                     continue
                 
+                # Handle probe messages
+                if content == "__PROBE__":
+                    print("Received probe, replying with status")
+                    # Clear the input file
+                    with open(INPUT_FILE_PATH, 'w') as f:
+                        pass
+                    # Write status to output file
+                    with open(OUTPUT_FILE_PATH, 'a') as f:
+                        f.write("[STATUS] MCP client is responsive and waiting for input\\n")
+                        f.flush()
+                    # Skip this cycle
+                    time.sleep(0.1)
+                    continue
+                
                 print(f"Received input: {content}")
                 
                 # Clear the input file after reading
@@ -554,23 +703,34 @@ def get_input(prompt: str) -> str:
                     with open(INPUT_FILE_PATH, 'w') as f:
                         pass
                 except Exception as clear_err:
-                    original_print(f"Error clearing input file: {clear_err}")
+                    print(f"Error clearing input file: {clear_err}")
                 
                 # Write acknowledgment to output
-                try:
-                    with open(OUTPUT_FILE_PATH, 'a') as f:
-                        f.write(f"Processing your query: {content}\\n")
-                        f.flush()
-                except Exception as ack_err:
-                    original_print(f"Error writing acknowledgment: {ack_err}")
+                with open(OUTPUT_FILE_PATH, 'a') as f:
+                    f.write(f"Processing query: {content}\\n")
+                    f.flush()
                 
                 return content
         except Exception as e:
-            print(f"Error reading input file (attempt {attempts}): {e}")
+            error_msg = f"Error reading input file (attempt {attempts}): {str(e)}"
+            print(error_msg)
+            with open(OUTPUT_FILE_PATH, 'a') as f:
+                f.write(error_msg + "\\n")
+                f.flush()
             attempts += 1
-            if attempts >= 10:
-                print("Too many errors reading input file, resetting...")
-                attempts = 0
+            
+            if attempts >= 5:
+                print("Too many errors reading input file, creating fresh file...")
+                try:
+                    # Try to recreate the input file
+                    with open(INPUT_FILE_PATH, 'w') as f:
+                        pass
+                    print("Input file recreated")
+                    attempts = 0
+                except Exception as recreate_err:
+                    print(f"Error recreating input file: {recreate_err}")
+            
+            time.sleep(1)
         
         # Check more frequently to be responsive
         time.sleep(0.2)
@@ -581,9 +741,18 @@ def output_print(*args, **kwargs):
     # Call the original print function
     original_print(*args, **kwargs)
     
-    # Write to the output file
+    # Get the formatted message
     try:
         message = " ".join(str(arg) for arg in args)
+        
+        # Check if the output file exists
+        if not os.path.exists(OUTPUT_FILE_PATH):
+            original_print(f"Output file {OUTPUT_FILE_PATH} does not exist, creating...")
+            # Try to create it
+            with open(OUTPUT_FILE_PATH, 'w') as f:
+                pass
+        
+        # Write to the output file
         with open(OUTPUT_FILE_PATH, 'a') as f:
             f.write(message + "\\n")
             f.flush()  # Make sure it's written immediately
