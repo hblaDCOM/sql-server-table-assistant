@@ -5,7 +5,8 @@ import asyncio
 import subprocess
 import threading
 import io
-from threading import Thread
+import time
+from threading import Thread, Lock
 from queue import Queue
 from flask import Flask, render_template, request, jsonify, session
 from flask_socketio import SocketIO
@@ -33,6 +34,9 @@ ALLOWED_IPS = os.getenv('ALLOWED_IPS', '127.0.0.1').split(',')
 # Dictionary to store active assistant processes
 active_sessions = {}
 
+# Lock for thread-safe access to active_sessions
+sessions_lock = Lock()
+
 @app.before_request
 def check_ip():
     """Check if client IP is in the allowlist"""
@@ -59,20 +63,23 @@ def handle_connect():
 @socketio.on('disconnect')
 def handle_disconnect():
     """Handle client disconnection"""
-    if 'uid' in session and session['uid'] in active_sessions:
-        # Terminate the assistant process
-        session_data = active_sessions[session['uid']]
-        if session_data['process']:
-            try:
-                session_data['process'].terminate()
-                print(f"Process terminated for session {session['uid']}")
-            except Exception as e:
-                print(f"Error terminating process: {e}")
+    if 'uid' in session:
+        uid = session['uid']
+        with sessions_lock:
+            if uid in active_sessions:
+                # Terminate the assistant process
+                session_data = active_sessions[uid]
+                if session_data['process']:
+                    try:
+                        session_data['process'].terminate()
+                        print(f"Process terminated for session {uid}")
+                    except Exception as e:
+                        print(f"Error terminating process: {e}")
+                    
+                # Mark this session for cleanup
+                session_data['active'] = False
                 
-        # Mark this session for cleanup
-        session_data['active'] = False
-        
-        print(f"Client disconnected: {session['uid']}")
+                print(f"Client disconnected: {uid}")
 
 @socketio.on('query')
 def handle_query(data):
@@ -87,23 +94,26 @@ def handle_query(data):
     if not query:
         return
     
-    # Start assistant process if not already running
-    if uid not in active_sessions:
-        # Start a new assistant process
-        try:
-            active_sessions[uid] = start_assistant_process(uid, request.sid)
-            # Send initial debug message to client
-            socketio.emit('response', {'text': 'Assistant process started. Processing query...'}, room=request.sid)
-        except Exception as e:
-            error_msg = f"Error starting assistant process: {str(e)}"
-            print(error_msg)
-            socketio.emit('response', {'text': error_msg}, room=request.sid)
-            return
+    # Acquire lock for thread-safe access
+    with sessions_lock:
+        # Start assistant process if not already running
+        if uid not in active_sessions or not is_process_alive(uid):
+            # Start a new assistant process
+            try:
+                active_sessions[uid] = start_assistant_process(uid, request.sid)
+                # Send initial debug message to client
+                socketio.emit('response', {'text': 'Assistant process started. Processing query...'}, room=request.sid)
+            except Exception as e:
+                error_msg = f"Error starting assistant process: {str(e)}"
+                print(error_msg)
+                socketio.emit('response', {'text': error_msg}, room=request.sid)
+                return
+        
+        # Get session data
+        session_data = active_sessions[uid]
     
-    # Send query to assistant process
-    session_data = active_sessions[uid]
-    
-    if not session_data['process'] or not session_data['active']:
+    # Check if process is alive
+    if not is_process_alive(uid):
         socketio.emit('response', {'text': 'Assistant process is not running. Please refresh the page.'}, room=request.sid)
         return
     
@@ -118,7 +128,50 @@ def handle_query(data):
     except Exception as e:
         error_msg = f"Error sending query to assistant: {str(e)}"
         print(error_msg)
-        socketio.emit('response', {'text': error_msg}, room=request.sid)
+        
+        # Try to restart the process
+        with sessions_lock:
+            if uid in active_sessions:
+                try:
+                    session_data = active_sessions[uid]
+                    if session_data['process']:
+                        try:
+                            session_data['process'].terminate()
+                        except:
+                            pass
+                    
+                    # Start a new process
+                    active_sessions[uid] = start_assistant_process(uid, request.sid)
+                    socketio.emit('response', {'text': 'Restarting assistant process. Please try your query again.'}, room=request.sid)
+                except Exception as restart_error:
+                    socketio.emit('response', {'text': f'Failed to restart assistant: {restart_error}. Please refresh the page.'}, room=request.sid)
+
+def is_process_alive(uid):
+    """Check if the process for a session is alive and healthy"""
+    with sessions_lock:
+        if uid not in active_sessions:
+            return False
+        
+        session_data = active_sessions[uid]
+        if not session_data['active']:
+            return False
+        
+        process = session_data['process']
+        if process is None:
+            return False
+        
+        # Check if process is still running
+        try:
+            # poll() returns None if process is running, otherwise return code
+            if process.poll() is None:
+                # Process is still running
+                return True
+            else:
+                # Process has exited
+                print(f"Process for session {uid} has exited with code {process.poll()}")
+                return False
+        except Exception:
+            return False
 
 def start_assistant_process(uid, sid):
     """Start a new assistant process for this session"""
@@ -127,7 +180,7 @@ def start_assistant_process(uid, sid):
     # Set up command to run the MCP client
     cmd = ["python", "mcp-ssms-client.py"]
     
-    # Launch the process - ensure proper encoding and buffering
+    # Launch the process with proper encoding and buffering
     process = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -149,7 +202,8 @@ def start_assistant_process(uid, sid):
         'sid': sid,
         'last_response': '',
         'output_buffer': [],
-        'expecting_input': False
+        'expecting_input': False,
+        'stdin_lock': Lock()  # Add a lock for stdin access
     }
     
     # Start the thread for reading assistant output
@@ -162,24 +216,71 @@ def start_assistant_process(uid, sid):
     process_thread.daemon = True
     process_thread.start()
     
-    # Wait briefly for process to initialize
-    socketio.sleep(1)
+    # Wait briefly for process to initialize (collect initial output)
+    time.sleep(2)
+    
+    # Process any initial output from the assistant
+    process_initial_output(uid)
     
     return session_data
 
+def process_initial_output(uid):
+    """Process any initial output from the assistant process startup"""
+    with sessions_lock:
+        if uid not in active_sessions:
+            return
+            
+        session_data = active_sessions[uid]
+        message_queue = session_data['message_queue']
+        
+        # Process any messages already in the queue
+        output_buffer = []
+        
+        # Non-blocking loop to collect initial messages
+        while not message_queue.empty():
+            try:
+                message = message_queue.get_nowait()
+                message_queue.task_done()
+                
+                # Skip special markers for initial output
+                if message not in ["__EOF__", "__EXPECTING_INPUT__"]:
+                    output_buffer.append(message)
+            except:
+                break
+        
+        # Store initial output in session data
+        if output_buffer:
+            session_data['initial_output'] = '\n'.join(output_buffer)
+            print(f"Collected initial output ({len(output_buffer)} lines)")
+
 def send_to_assistant(uid, query):
     """Send query to the assistant process"""
-    session_data = active_sessions[uid]
-    process = session_data['process']
+    with sessions_lock:
+        if uid not in active_sessions:
+            raise Exception("Session not found")
+            
+        session_data = active_sessions[uid]
+        process = session_data['process']
+        
+        if process is None or process.poll() is not None:
+            raise Exception("Process is not running")
+            
+        if process.stdin is None or process.stdin.closed:
+            raise Exception("Process stdin is closed")
     
-    # Write the query to the process stdin and include a newline
-    if process.stdin:
+    # Use a lock to ensure only one thread writes to stdin at a time
+    with session_data['stdin_lock']:
         try:
+            # Write the query to the process stdin and include a newline
             process.stdin.write(f"{query}\n")
             process.stdin.flush()
             print(f"Successfully sent query to process: {query}")
         except Exception as e:
             print(f"Error writing to stdin: {e}")
+            # Mark process as inactive to trigger restart on next query
+            with sessions_lock:
+                if uid in active_sessions:
+                    active_sessions[uid]['active'] = False
             raise
 
 def read_assistant_output(uid, stdout, message_queue):
@@ -187,8 +288,9 @@ def read_assistant_output(uid, stdout, message_queue):
     try:
         # Read continuous output from the process
         for line in iter(stdout.readline, ''):
-            if not active_sessions.get(uid, {}).get('active', False):
-                break
+            with sessions_lock:
+                if uid not in active_sessions or not active_sessions[uid]['active']:
+                    break
             
             # Debugging
             print(f"Output from assistant: {line.strip()}")
@@ -201,31 +303,36 @@ def read_assistant_output(uid, stdout, message_queue):
                 "Enter your Query", 
                 "Do you want to", 
                 "Enter your feedback", 
-                "Press Enter to exit"
+                "Press Enter to exit",
+                "Type your questions"
             ]):
                 message_queue.put("__EXPECTING_INPUT__")
                 print("Detected input prompt - signaling")
     except Exception as e:
         error_msg = f"Error reading assistant output for session {uid}: {str(e)}"
         print(error_msg)
-        if active_sessions.get(uid, {}).get('active', False):
-            message_queue.put(f"Error reading assistant output: {str(e)}")
+        with sessions_lock:
+            if uid in active_sessions and active_sessions[uid]['active']:
+                message_queue.put(f"Error reading assistant output: {str(e)}")
     finally:
         # Mark end of output
         message_queue.put("__EOF__")
         print("Reached EOF for assistant output")
         
         # Cleanup
-        if uid in active_sessions:
-            active_sessions[uid]['active'] = False
+        with sessions_lock:
+            if uid in active_sessions:
+                active_sessions[uid]['active'] = False
 
 def process_messages(uid, sid):
     """Process messages from the queue and send to client"""
-    if uid not in active_sessions:
-        return
-        
-    session_data = active_sessions[uid]
-    message_queue = session_data['message_queue']
+    with sessions_lock:
+        if uid not in active_sessions:
+            return
+            
+        session_data = active_sessions[uid]
+        message_queue = session_data['message_queue']
+    
     output_buffer = []
     send_timer = None
     
@@ -234,12 +341,21 @@ def process_messages(uid, sid):
         nonlocal output_buffer
         if output_buffer:
             response_text = '\n'.join(output_buffer)
-            session_data['last_response'] = response_text
+            
+            with sessions_lock:
+                if uid in active_sessions:
+                    active_sessions[uid]['last_response'] = response_text
+            
             socketio.emit('response', {'text': response_text}, room=sid)
             print(f"Sent {len(output_buffer)} lines to client")
             output_buffer = []
     
-    while active_sessions.get(uid, {}).get('active', False):
+    while True:
+        # Check if session is still active
+        with sessions_lock:
+            if uid not in active_sessions or not active_sessions[uid]['active']:
+                break
+        
         try:
             # Get message from queue (wait up to 0.5 seconds)
             try:
@@ -278,13 +394,15 @@ def process_messages(uid, sid):
         except Exception as e:
             print(f"Error processing messages for session {uid}: {str(e)}")
             
-            if active_sessions.get(uid, {}).get('active', False):
-                socketio.emit('response', {'text': f"Error processing assistant response: {str(e)}"}, room=sid)
+            with sessions_lock:
+                if uid in active_sessions and active_sessions[uid]['active']:
+                    socketio.emit('response', {'text': f"Error processing assistant response: {str(e)}"}, room=sid)
     
     # Final cleanup
-    if uid in active_sessions:
-        active_sessions[uid]['active'] = False
-        print(f"Message processing ended for session {uid}")
+    with sessions_lock:
+        if uid in active_sessions:
+            active_sessions[uid]['active'] = False
+            print(f"Message processing ended for session {uid}")
 
 if __name__ == '__main__':
     # Check if templates directory exists, if not create it
