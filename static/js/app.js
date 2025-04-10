@@ -6,6 +6,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const statusIndicator = document.getElementById('status-indicator');
     const statusText = document.getElementById('status-text');
     
+    // Track if we're waiting for a response
+    let waitingForResponse = false;
+    let pendingMessage = null;
+    
     // Connect to Socket.IO server
     const socket = io();
     
@@ -29,7 +33,26 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // Handle receiving messages from the server
     socket.on('response', (data) => {
-        addAssistantMessage(data.text);
+        // Check if this is an update to a pending message or a new message
+        if (pendingMessage && 
+            (data.text.includes('Processing query') || 
+             data.text.includes('Waiting for response'))) {
+            // Update the pending message with a progress indicator
+            pendingMessage.innerHTML = `<p>${escapeHtml(data.text)} <span class="loading-dots"><span>.</span><span>.</span><span>.</span></span></p>`;
+        } else {
+            // For more substantial responses, create a new message
+            addAssistantMessage(data.text);
+            // If this was a full response, clear the pending state
+            if (!data.text.includes('Processing query') && 
+                !data.text.includes('Waiting for response')) {
+                waitingForResponse = false;
+                pendingMessage = null;
+                
+                // Re-enable input
+                userInput.disabled = false;
+                sendButton.disabled = false;
+            }
+        }
     });
     
     // Send button click handler
@@ -45,16 +68,45 @@ document.addEventListener('DOMContentLoaded', () => {
     // Function to send a message
     function sendMessage() {
         const message = userInput.value.trim();
-        if (message === '') return;
+        if (message === '' || waitingForResponse) return;
         
         // Add user message to chat
         addUserMessage(message);
+        
+        // Disable input while waiting for response
+        waitingForResponse = true;
+        userInput.disabled = true;
+        sendButton.disabled = true;
+        
+        // Create a pending message for the assistant
+        pendingMessage = document.createElement('div');
+        pendingMessage.classList.add('message', 'assistant', 'pending');
+        pendingMessage.innerHTML = `<p>Processing your query <span class="loading-dots"><span>.</span><span>.</span><span>.</span></span></p>`;
+        chatMessages.appendChild(pendingMessage);
+        scrollToBottom();
         
         // Clear input
         userInput.value = '';
         
         // Send message to server
         socket.emit('query', { query: message });
+        
+        // Safety timeout - re-enable input after 30 seconds if no response
+        setTimeout(() => {
+            if (waitingForResponse) {
+                waitingForResponse = false;
+                userInput.disabled = false;
+                sendButton.disabled = false;
+                
+                // Add error message
+                if (pendingMessage) {
+                    pendingMessage.innerHTML = `<p>The request took too long to process. Please try again.</p>`;
+                    pendingMessage = null;
+                } else {
+                    addSystemMessage('The request took too long to process. Please try again.');
+                }
+            }
+        }, 30000);
     }
     
     // Helper functions to add messages to the chat
@@ -67,6 +119,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     
     function addAssistantMessage(text) {
+        // Replace existing pending message if it exists
+        if (pendingMessage) {
+            chatMessages.removeChild(pendingMessage);
+            pendingMessage = null;
+        }
+        
         const messageElement = document.createElement('div');
         messageElement.classList.add('message', 'assistant');
         
@@ -99,6 +157,20 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (part.startsWith('```sql')) {
                     const sqlCode = part.replace(/```sql\n?/, '').replace(/\n?```$/, '');
                     formattedText += `<div class="sql-code">${escapeHtml(sqlCode)}</div>`;
+                } else if (part.trim()) {
+                    formattedText += `<p>${formatMessageText(part)}</p>`;
+                }
+            }
+            
+            messageElement.innerHTML = formattedText;
+        } else if (text.includes('===== QUERY RESULTS =====')) {
+            // Handle tabular results
+            const parts = text.split(/(===== QUERY RESULTS =====[\s\S]*?==========================)/g);
+            let formattedText = '';
+            
+            for (const part of parts) {
+                if (part.startsWith('===== QUERY RESULTS =====')) {
+                    formattedText += `<div class="query-results">${formatMessageText(part)}</div>`;
                 } else if (part.trim()) {
                     formattedText += `<p>${formatMessageText(part)}</p>`;
                 }

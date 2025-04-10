@@ -4,6 +4,7 @@ import json
 import asyncio
 import subprocess
 import threading
+import io
 from threading import Thread
 from queue import Queue
 from flask import Flask, render_template, request, jsonify, session
@@ -91,6 +92,8 @@ def handle_query(data):
         # Start a new assistant process
         try:
             active_sessions[uid] = start_assistant_process(uid, request.sid)
+            # Send initial debug message to client
+            socketio.emit('response', {'text': 'Assistant process started. Processing query...'}, room=request.sid)
         except Exception as e:
             error_msg = f"Error starting assistant process: {str(e)}"
             print(error_msg)
@@ -104,9 +107,14 @@ def handle_query(data):
         socketio.emit('response', {'text': 'Assistant process is not running. Please refresh the page.'}, room=request.sid)
         return
     
+    # Debug message
+    print(f"Attempting to send query to assistant: {query}")
+    
     # Send the query to the assistant process
     try:
         send_to_assistant(uid, query)
+        # Send intermediate message to client
+        socketio.emit('response', {'text': 'Query sent to assistant. Waiting for response...'}, room=request.sid)
     except Exception as e:
         error_msg = f"Error sending query to assistant: {str(e)}"
         print(error_msg)
@@ -119,14 +127,14 @@ def start_assistant_process(uid, sid):
     # Set up command to run the MCP client
     cmd = ["python", "mcp-ssms-client.py"]
     
-    # Launch the process
+    # Launch the process - ensure proper encoding and buffering
     process = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,  # Line buffered
+        bufsize=0,  # Unbuffered
+        universal_newlines=True,  # Text mode with universal newlines
         shell=False
     )
     
@@ -154,6 +162,9 @@ def start_assistant_process(uid, sid):
     process_thread.daemon = True
     process_thread.start()
     
+    # Wait briefly for process to initialize
+    socketio.sleep(1)
+    
     return session_data
 
 def send_to_assistant(uid, query):
@@ -161,10 +172,15 @@ def send_to_assistant(uid, query):
     session_data = active_sessions[uid]
     process = session_data['process']
     
-    # Write the query to the process stdin
-    process.stdin.write(query + '\n')
-    process.stdin.flush()
-    print(f"Sent query to assistant process: {query}")
+    # Write the query to the process stdin and include a newline
+    if process.stdin:
+        try:
+            process.stdin.write(f"{query}\n")
+            process.stdin.flush()
+            print(f"Successfully sent query to process: {query}")
+        except Exception as e:
+            print(f"Error writing to stdin: {e}")
+            raise
 
 def read_assistant_output(uid, stdout, message_queue):
     """Read and process output from the assistant process"""
@@ -173,20 +189,31 @@ def read_assistant_output(uid, stdout, message_queue):
         for line in iter(stdout.readline, ''):
             if not active_sessions.get(uid, {}).get('active', False):
                 break
-                
+            
+            # Debugging
+            print(f"Output from assistant: {line.strip()}")
+            
             # Add the line to the message queue
             message_queue.put(line.rstrip())
             
             # Check for patterns that indicate we're expecting input
-            if "Enter your Query" in line or "Do you want to" in line or "Enter your feedback" in line:
+            if any(pattern in line for pattern in [
+                "Enter your Query", 
+                "Do you want to", 
+                "Enter your feedback", 
+                "Press Enter to exit"
+            ]):
                 message_queue.put("__EXPECTING_INPUT__")
+                print("Detected input prompt - signaling")
     except Exception as e:
+        error_msg = f"Error reading assistant output for session {uid}: {str(e)}"
+        print(error_msg)
         if active_sessions.get(uid, {}).get('active', False):
-            print(f"Error reading assistant output for session {uid}: {str(e)}")
             message_queue.put(f"Error reading assistant output: {str(e)}")
     finally:
         # Mark end of output
         message_queue.put("__EOF__")
+        print("Reached EOF for assistant output")
         
         # Cleanup
         if uid in active_sessions:
@@ -200,39 +227,54 @@ def process_messages(uid, sid):
     session_data = active_sessions[uid]
     message_queue = session_data['message_queue']
     output_buffer = []
+    send_timer = None
+    
+    def send_buffered_output():
+        """Helper to send the current buffer to the client"""
+        nonlocal output_buffer
+        if output_buffer:
+            response_text = '\n'.join(output_buffer)
+            session_data['last_response'] = response_text
+            socketio.emit('response', {'text': response_text}, room=sid)
+            print(f"Sent {len(output_buffer)} lines to client")
+            output_buffer = []
     
     while active_sessions.get(uid, {}).get('active', False):
         try:
-            # Get message from queue (wait up to 0.1 seconds)
+            # Get message from queue (wait up to 0.5 seconds)
             try:
-                message = message_queue.get(timeout=0.1)
+                message = message_queue.get(timeout=0.5)
+                message_queue.task_done()
             except:
+                # No new messages, but flush any existing messages in buffer after delay
+                if output_buffer and len(output_buffer) > 0:
+                    send_buffered_output()
                 continue
                 
             # Check for special markers
             if message == "__EOF__":
                 # End of process output
-                if output_buffer:
-                    response_text = '\n'.join(output_buffer)
-                    socketio.emit('response', {'text': response_text}, room=sid)
+                send_buffered_output()
                 break
             elif message == "__EXPECTING_INPUT__":
-                # Assistant is waiting for input, send buffer to client
-                if output_buffer:
-                    response_text = '\n'.join(output_buffer)
-                    session_data['last_response'] = response_text
-                    socketio.emit('response', {'text': response_text}, room=sid)
-                    output_buffer = []
+                # Assistant is waiting for input, send buffer to client immediately
+                send_buffered_output()
             else:
                 # Normal message, add to buffer
                 output_buffer.append(message)
                 
-                # If buffer gets too large, send it immediately
-                if len(output_buffer) > 20:
-                    response_text = '\n'.join(output_buffer)
-                    session_data['last_response'] = response_text
-                    socketio.emit('response', {'text': response_text}, room=sid)
-                    output_buffer = []
+                # Send immediately if buffer gets large enough
+                if len(output_buffer) >= 5:
+                    send_buffered_output()
+                # Or schedule a send after a short delay for responsiveness
+                elif len(output_buffer) == 1:
+                    if send_timer:
+                        send_timer.cancel()
+                    def delayed_send():
+                        if output_buffer:  # Check if still has content
+                            send_buffered_output()
+                    send_timer = threading.Timer(0.8, delayed_send)
+                    send_timer.start()
         except Exception as e:
             print(f"Error processing messages for session {uid}: {str(e)}")
             
@@ -242,6 +284,7 @@ def process_messages(uid, sid):
     # Final cleanup
     if uid in active_sessions:
         active_sessions[uid]['active'] = False
+        print(f"Message processing ended for session {uid}")
 
 if __name__ == '__main__':
     # Check if templates directory exists, if not create it
@@ -258,7 +301,7 @@ if __name__ == '__main__':
     
     print(f"Starting SQL Server Table Assistant Web Interface on port {port}")
     print(f"Allowed IPs: {', '.join(ALLOWED_IPS)}")
-    print("Access the interface at http://localhost:{port} (or your server IP)")
+    print(f"Access the interface at http://localhost:{port} (or your server IP)")
     
     # Start the web server
     socketio.run(app, host='0.0.0.0', port=port, debug=True, allow_unsafe_werkzeug=True) 
