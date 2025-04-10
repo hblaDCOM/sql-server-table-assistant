@@ -16,6 +16,7 @@ This application lets you interact with a specific SQL Server table using natura
 * **Context-Aware Conversations**: Maintain context across multiple queries
 * **Natural Language Explanations**: Get plain English explanations of query results
 * **Token Optimization**: Smart caching and context management to minimize API usage
+* **Web Interface**: Access the Table Assistant through a browser with IP-based access control
 
 ## What is MCP?
 MCP (Modal Context Protocol) is a methodology that standardizes how context is bound to LLMs, providing a standard way to connect AI models to different data sources and tools.
@@ -85,13 +86,17 @@ MSSQL_DRIVER={ODBC Driver 18 for SQL Server}
 # Table Configuration
 MSSQL_TABLE_SCHEMA=dbo
 MSSQL_TABLE_NAME=your_table_name
+
+# Web Interface Configuration (only needed if using web interface)
+WEB_PORT=5000
+ALLOWED_IPS=127.0.0.1,192.168.1.100,10.0.0.5
 ```
 
 ## Running the Table Assistant
 Once you've set up your environment and dependencies, you're ready to interact with the Table Assistant.
 
-### Run the Client Script
-Execute the following command to start the assistant:
+### Command Line Interface
+Execute the following command to start the assistant in command line mode:
 
 ```bash
 python mcp-ssms-client.py
@@ -109,6 +114,31 @@ Special commands:
 
 Enter your Query: Show me all employees with a salary over $50,000
 ```
+
+### Web Interface
+To start the web interface, allowing multiple users to access the Table Assistant remotely via browser:
+
+```bash
+python web_server.py
+```
+
+The web server will start on the port specified in your `.env` file (default: 5000). Users with IP addresses listed in the `ALLOWED_IPS` environment variable can access the Table Assistant by navigating to:
+
+```
+http://your-server-ip:5000
+```
+
+The web interface provides the same functionality as the command line, but in a more user-friendly format accessible from any device with a web browser.
+
+#### Security Considerations for Web Deployment
+
+When deploying the web interface, especially on a network accessible to multiple users, keep these security considerations in mind:
+
+1. **IP Allowlist**: Strictly limit access to trusted IP addresses
+2. **Port Forwarding**: Only forward the web server port to trusted networks
+3. **HTTPS**: Consider setting up HTTPS for secure connections (using a reverse proxy like Nginx)
+4. **Firewall Rules**: Configure firewall rules to restrict access to the application
+5. **Regular Updates**: Keep all dependencies updated to patch security vulnerabilities
 
 ## Interactive Query Workflow
 
@@ -197,75 +227,72 @@ The results show the highest paid employee in each department along with their h
 - In IT, Mary Williams is the top earner with $98,000 and has been with the company since May 22, 2017.
 - In Marketing, Bob Miller makes $82,000 and started on July 8, 2019.
 - In Sales, John Davis has the highest salary at $92,000 and was hired on November 14, 2016.
-
-Mary Williams from IT has the highest overall salary among all the top-earning employees across departments.
-==============================```
-
-## Diagnostics and Special Commands
-
-The application includes several special commands:
-
-- `/diagnose` - Run comprehensive table access diagnostics
-- `/refresh_schema` - Refresh the table schema
-- `/history` - View a list of all queries executed in the current session
-
-### Query History
-
-The query history feature helps you keep track of all queries executed during the session:
-
-```
-===== QUERY HISTORY =====
-1. [2023-09-01 15:24:12] Show me all employees with a salary over $50,000
-   SQL: SELECT EmployeeName, Department, Salary FROM dbo.Employees WHERE Salary > 50000 ORDER...
-   Iterations: 1, Success: True
-
-2. [2023-09-01 15:32:45] Show me the highest paid employee in each department
-   SQL: SELECT Department, EmployeeName, Salary, HireDate FROM (SELECT Department, EmployeeName...
-   Iterations: 2, Success: True
-=======================
 ```
 
-## Query Logging
+## Deployment Options
 
-All queries and results are automatically saved to `logs/queries/` as JSON files for future reference. Each log includes:
+The SQL Server Table Assistant can be deployed in several ways depending on your needs:
 
-- The original natural language query
-- All SQL iterations and feedback
-- The final SQL query that was executed
-- Query results
-- Timestamps
+### 1. Local Installation
 
-This allows you to track how queries evolve over time and maintain a record of all database interactions.
+The simplest deployment is to run the application locally on your machine. This works well for individual use or small teams sharing a computer.
 
-## Security Considerations
+### 2. Network Deployment
 
-This application implements several security features:
+For team access, you can deploy the web interface on a server within your network:
 
-1. **Single table access**: Queries are restricted to the configured table
-2. **Query validation**: All SQL queries are shown for user approval before execution
-3. **Transaction safety**: INSERT/UPDATE/DELETE tests use transactions with rollback
-4. **Error tracing**: Detailed error logs help diagnose issues without exposing sensitive information
-5. **SQL injection prevention**: Structured query generation reduces the risk of SQL injection
+1. Set up the application on a server accessible to your team
+2. Configure the `ALLOWED_IPS` in the `.env` file to include the IP addresses of team members
+3. Share the URL with authorized users
 
-## Connection Issues
+### 3. Production Deployment Recommendations
 
-If you encounter connection issues:
+For a more robust production deployment:
 
-1. Verify your server name or IP address is correct
-2. Ensure the SQL Server is running and accepts remote connections
-3. Check firewall settings to allow SQL Server traffic
-4. Verify that the ODBC driver specified in your .env file is installed
-5. Test connectivity with other tools like SSMS or sqlcmd
+1. **Use a reverse proxy** (like Nginx) to handle HTTPS and additional security layers
+2. **Set up process management** with a tool like supervisord or systemd to ensure the application restarts if it crashes
+3. **Implement proper logging** to a dedicated log directory or service
+4. **Create a dedicated service account** with limited permissions to run the application
+5. **Regular backups** of query logs and other important data
 
-## Troubleshooting Token Usage
+Example Nginx configuration for SSL termination:
 
-If you encounter rate limit errors with Azure OpenAI:
+```nginx
+server {
+    listen 443 ssl;
+    server_name your-domain.com;
 
-1. **Wait before retrying**: Rate limits are usually time-based, so waiting 60 seconds may resolve the issue
-2. **Increase your quota**: Visit https://aka.ms/oai/quotaincrease to request a higher rate limit
-3. **Upgrade your tier**: Free accounts may need to upgrade to Pay-as-you-Go
-4. **Use the /refresh_schema command**: This regenerates the schema summary which might reduce token usage
-5. **Check your prompt length**: Very complex questions might trigger more token usage
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
+
+    location / {
+        proxy_pass http://localhost:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+Example systemd service file (save as `/etc/systemd/system/sql-assistant.service`):
+
+```ini
+[Unit]
+Description=SQL Server Table Assistant Web Interface
+After=network.target
+
+[Service]
+User=your-service-user
+WorkingDirectory=/path/to/application
+ExecStart=/usr/bin/python3 web_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ## License
 
