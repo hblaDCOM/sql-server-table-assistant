@@ -177,19 +177,32 @@ def start_assistant_process(uid, sid):
     """Start a new assistant process for this session"""
     print(f"Starting assistant process for session {uid}")
     
-    # Set up command to run the MCP client
-    cmd = ["python", "mcp-ssms-client.py"]
+    # Set up command to run the MCP client with explicit arguments
+    cmd = [sys.executable, "mcp-ssms-client.py"]
     
     # Launch the process with proper encoding and buffering
-    process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=0,  # Unbuffered
-        universal_newlines=True,  # Text mode with universal newlines
-        shell=False
-    )
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,  # Unbuffered
+            universal_newlines=True,  # Text mode with universal newlines
+            shell=False,
+            env=os.environ.copy()  # Pass current environment
+        )
+        
+        # Check if process started correctly
+        if process.poll() is not None:
+            # Process failed to start or terminated immediately
+            error_msg = f"Process exited immediately with code {process.poll()}"
+            print(error_msg)
+            raise Exception(error_msg)
+    
+    except Exception as e:
+        print(f"Failed to start assistant process: {e}")
+        raise
     
     # Create a queue for messages
     message_queue = Queue()
@@ -203,7 +216,8 @@ def start_assistant_process(uid, sid):
         'last_response': '',
         'output_buffer': [],
         'expecting_input': False,
-        'stdin_lock': Lock()  # Add a lock for stdin access
+        'stdin_lock': Lock(),  # Add a lock for stdin access
+        'initialization_complete': False
     }
     
     # Start the thread for reading assistant output
@@ -216,12 +230,52 @@ def start_assistant_process(uid, sid):
     process_thread.daemon = True
     process_thread.start()
     
-    # Wait briefly for process to initialize (collect initial output)
-    time.sleep(2)
+    # Wait for process to initialize and check if it's responding
+    initialization_timeout = 5  # seconds
+    start_time = time.time()
+    initialization_success = False
+    
+    # Read initial output to confirm process is running properly
+    while time.time() - start_time < initialization_timeout:
+        time.sleep(0.5)
+        
+        with sessions_lock:
+            if uid not in active_sessions:
+                break
+                
+            # If we've collected any output or detected an input prompt, consider initialization successful
+            if not message_queue.empty() or session_data.get('initial_output'):
+                initialization_success = True
+                session_data['initialization_complete'] = True
+                break
+                
+            # Check if process is still running
+            if process.poll() is not None:
+                error_msg = f"Process terminated during initialization with code {process.poll()}"
+                print(error_msg)
+                raise Exception(error_msg)
+    
+    if not initialization_success:
+        error_msg = "Timeout waiting for assistant process to initialize"
+        print(error_msg)
+        process.terminate()
+        raise Exception(error_msg)
     
     # Process any initial output from the assistant
     process_initial_output(uid)
     
+    # Send a test ping to verify stdin is working
+    try:
+        with session_data['stdin_lock']:
+            # Just try to write a newline - harmless but verifies the pipe is working
+            process.stdin.write("\n")
+            process.stdin.flush()
+    except Exception as e:
+        print(f"Error testing stdin: {e}")
+        process.terminate()
+        raise Exception(f"Process started but stdin communication failed: {e}")
+    
+    print(f"Assistant process started successfully for session {uid}")
     return session_data
 
 def process_initial_output(uid):
@@ -255,6 +309,13 @@ def process_initial_output(uid):
 
 def send_to_assistant(uid, query):
     """Send query to the assistant process"""
+    # Prepare the query by ensuring it has no trailing whitespace and ends with a newline
+    query = query.strip()
+    if not query:
+        return
+        
+    query_with_newline = query + "\n"
+    
     with sessions_lock:
         if uid not in active_sessions:
             raise Exception("Session not found")
@@ -262,19 +323,38 @@ def send_to_assistant(uid, query):
         session_data = active_sessions[uid]
         process = session_data['process']
         
-        if process is None or process.poll() is not None:
-            raise Exception("Process is not running")
+        if process is None:
+            raise Exception("Process is not initialized")
+            
+        if process.poll() is not None:
+            raise Exception(f"Process has terminated with code {process.poll()}")
             
         if process.stdin is None or process.stdin.closed:
             raise Exception("Process stdin is closed")
+        
+        # Check if initialization was successful
+        if not session_data.get('initialization_complete', False):
+            raise Exception("Process initialization was not completed")
     
     # Use a lock to ensure only one thread writes to stdin at a time
     with session_data['stdin_lock']:
         try:
-            # Write the query to the process stdin and include a newline
-            process.stdin.write(f"{query}\n")
+            # Write the query to the process stdin
+            process.stdin.write(query_with_newline)
             process.stdin.flush()
             print(f"Successfully sent query to process: {query}")
+            
+            # Verify process is still running after write
+            if process.poll() is not None:
+                raise Exception(f"Process terminated after write with code {process.poll()}")
+                
+            return True
+        except BrokenPipeError:
+            print(f"Broken pipe when writing to stdin")
+            with sessions_lock:
+                if uid in active_sessions:
+                    active_sessions[uid]['active'] = False
+            raise Exception("Connection to assistant process was lost (broken pipe)")
         except Exception as e:
             print(f"Error writing to stdin: {e}")
             # Mark process as inactive to trigger restart on next query
@@ -285,29 +365,64 @@ def send_to_assistant(uid, query):
 
 def read_assistant_output(uid, stdout, message_queue):
     """Read and process output from the assistant process"""
+    ready_patterns = [
+        "Enter your Query", 
+        "Do you want to", 
+        "Enter your feedback", 
+        "Press Enter to exit",
+        "Type your questions",
+        "Table Assistant is ready",
+        "special commands:"
+    ]
+    
     try:
+        # Set initial line counter to detect startup
+        line_count = 0
+        detected_ready = False
+        
         # Read continuous output from the process
         for line in iter(stdout.readline, ''):
+            line_count += 1
+            
             with sessions_lock:
                 if uid not in active_sessions or not active_sessions[uid]['active']:
                     break
             
+            # Strip the line and check if empty
+            stripped_line = line.rstrip()
+            if not stripped_line:
+                continue
+                
             # Debugging
-            print(f"Output from assistant: {line.strip()}")
+            print(f"Output from assistant [{line_count}]: {stripped_line}")
             
             # Add the line to the message queue
-            message_queue.put(line.rstrip())
+            message_queue.put(stripped_line)
             
-            # Check for patterns that indicate we're expecting input
-            if any(pattern in line for pattern in [
-                "Enter your Query", 
-                "Do you want to", 
-                "Enter your feedback", 
-                "Press Enter to exit",
-                "Type your questions"
-            ]):
+            # Check for patterns that indicate the assistant is ready for input
+            lower_line = stripped_line.lower()
+            if any(pattern.lower() in lower_line for pattern in ready_patterns):
                 message_queue.put("__EXPECTING_INPUT__")
-                print("Detected input prompt - signaling")
+                detected_ready = True
+                print(f"Detected input prompt: {stripped_line}")
+                
+                # Mark initialization as complete when we detect first prompt
+                with sessions_lock:
+                    if uid in active_sessions:
+                        active_sessions[uid]['initialization_complete'] = True
+            
+            # Special handling for initial output - if we get a reasonable number of 
+            # lines but no prompt detected, force an input signal
+            if line_count > 10 and not detected_ready:
+                with sessions_lock:
+                    if uid in active_sessions:
+                        # Check if initialization is already marked complete
+                        if not active_sessions[uid].get('initialization_complete', False):
+                            print("Reached line threshold without prompt, assuming ready for input")
+                            active_sessions[uid]['initialization_complete'] = True
+                            detected_ready = True
+                            message_queue.put("__EXPECTING_INPUT__")
+                
     except Exception as e:
         error_msg = f"Error reading assistant output for session {uid}: {str(e)}"
         print(error_msg)
@@ -317,7 +432,7 @@ def read_assistant_output(uid, stdout, message_queue):
     finally:
         # Mark end of output
         message_queue.put("__EOF__")
-        print("Reached EOF for assistant output")
+        print(f"Reached EOF for assistant output (read {line_count} lines)")
         
         # Cleanup
         with sessions_lock:
