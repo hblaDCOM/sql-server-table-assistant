@@ -18,6 +18,7 @@ load_dotenv()
 
 # Temp directory for IPC files
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "sql_assistant")
+os.makedirs(TEMP_DIR, exist_ok=True)  # Create the directory if it doesn't exist
 
 # Create Flask app
 app = Flask(__name__, 
@@ -108,15 +109,21 @@ def start_client_process(uid, sid):
     """Start a new client process with input/output files for IPC"""
     print(f"Starting new client process for session {uid}")
     
-    # Create temporary files for IPC
-    input_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, prefix=f'mcp_input_{uid}_', suffix='.txt')
-    output_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, prefix=f'mcp_output_{uid}_', suffix='.txt')
-    input_path = input_file.name
-    output_path = output_file.name
+    # Create temporary files in our managed directory
+    input_path = os.path.join(TEMP_DIR, f'input_{uid}.txt')
+    output_path = os.path.join(TEMP_DIR, f'output_{uid}.txt')
     
-    # Close the files so the subprocess can use them
-    input_file.close()
-    output_file.close()
+    # Initialize the files
+    try:
+        with open(input_path, 'w') as f:
+            f.write("")  # Empty the input file
+            
+        with open(output_path, 'w') as f:
+            f.write("")  # Empty the output file
+    except Exception as e:
+        print(f"Error initializing IPC files: {e}")
+        socketio.emit('response', {'text': f"Error starting SQL Assistant: {str(e)}"}, room=sid)
+        return False
     
     # Create a background process runner
     def run_process():
@@ -291,6 +298,9 @@ def start_client_process(uid, sid):
     monitor_thread.daemon = True
     monitor_thread.start()
     
+    # Start heartbeat thread
+    heartbeat_thread = start_heartbeat(uid, input_path)
+    
     # Wait for process to initialize
     print(f"Waiting for client process {uid} to initialize")
     time.sleep(3)  # Increased wait time
@@ -313,11 +323,31 @@ def run_client_query(uid, query, sid):
     input_path = session_data['input_path']
     
     try:
+        # Check if process is still alive
+        if not is_process_alive(uid):
+            print(f"Client process for session {uid} is not running")
+            return False
+            
         # Write query to input file with newline
         with open(input_path, 'w') as f:
             f.write(query + '\n')
+            f.flush()  # Make sure it's written immediately
+            os.fsync(f.fileno())  # Force write to disk
+        
+        # Verify file was written
+        try:
+            with open(input_path, 'r') as f:
+                content = f.read().strip()
+                if not content:
+                    print(f"Warning: Input file appears empty after writing query for session {uid}")
+        except Exception as verify_err:
+            print(f"Error verifying input file write: {verify_err}")
         
         print(f"Wrote query to input file for session {uid}: {query}")
+        
+        # Notify user we're processing their query
+        socketio.emit('response', {'text': f"\nProcessing: {query}\n"}, room=sid)
+        
         return True
     except Exception as e:
         print(f"Error writing query to input file: {e}")
@@ -365,11 +395,18 @@ def is_process_alive(session_id):
 
 def read_assistant_output(uid, ws):
     """Read assistant output file and send contents to client."""
-    output_file = os.path.join(TEMP_DIR, f'output_{uid}.txt')
+    if uid not in active_sessions:
+        return
+        
+    output_path = active_sessions[uid]['output_path']
     
     # Initialize the file with empty content to avoid reading errors
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write('')
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write('')
+            f.flush()
+    except Exception as e:
+        logging.error(f"Error initializing output file: {e}")
     
     # Give the client process a moment to start
     time.sleep(1)
@@ -378,7 +415,7 @@ def read_assistant_output(uid, ws):
     last_flush_time = time.time()
     last_position = 0
     
-    while True:
+    while uid in active_sessions and active_sessions[uid]['active']:
         if not is_process_alive(uid):
             # Process has ended, send any remaining output
             if buffer:
@@ -387,9 +424,13 @@ def read_assistant_output(uid, ws):
             break
             
         try:
-            with open(output_file, 'r', encoding='utf-8') as f:
+            if not os.path.exists(output_path):
+                time.sleep(0.5)
+                continue
+                
+            with open(output_path, 'r', encoding='utf-8') as f:
                 # Check if the file has been truncated
-                file_size = os.path.getsize(output_file)
+                file_size = os.path.getsize(output_path)
                 if file_size < last_position:
                     # File was truncated, reset position
                     last_position = 0
@@ -418,6 +459,37 @@ def read_assistant_output(uid, ws):
     if buffer:
         ws.send(json.dumps({"type": "assistant", "content": ''.join(buffer)}))
 
+def start_heartbeat(uid, input_path):
+    """Start a heartbeat thread to keep the client process responsive"""
+    
+    def send_heartbeat():
+        while uid in active_sessions and active_sessions[uid]['active']:
+            try:
+                if is_process_alive(uid):
+                    # Check if the client is waiting for input
+                    with open(input_path, 'r') as f:
+                        content = f.read().strip()
+                    
+                    # Only send heartbeat if the input file is empty
+                    if not content:
+                        # Write a special heartbeat to the input file every 30 seconds
+                        with open(input_path, 'w') as f:
+                            f.write("__HEARTBEAT__\n")
+                            f.flush()
+                        print(f"Sent heartbeat to process {uid}")
+            except Exception as e:
+                print(f"Error in heartbeat thread: {e}")
+            
+            # Wait 30 seconds before next heartbeat
+            time.sleep(30)
+    
+    # Start heartbeat thread
+    heartbeat_thread = threading.Thread(target=send_heartbeat)
+    heartbeat_thread.daemon = True
+    heartbeat_thread.start()
+    
+    return heartbeat_thread
+
 if __name__ == '__main__':
     # Check if we need to create the file-based client script
     client_file_script = Path("mcp-ssms-client-file.py")
@@ -441,24 +513,67 @@ OUTPUT_FILE_PATH = sys.argv[2] if len(sys.argv) > 2 else None
 def get_input(prompt: str) -> str:
     # Print to stdout for debugging
     print(f"Waiting for input: {prompt}")
+    sys.stdout.flush()  # Ensure the prompt is output immediately
+    
+    # Write a marker to the output file to indicate we're waiting for input
+    try:
+        with open(OUTPUT_FILE_PATH, 'a') as f:
+            f.write(f"Waiting for your input: {prompt}\\n")
+            f.flush()
+    except Exception as e:
+        original_print(f"Error writing prompt to output file: {e}")
     
     # Wait for input to appear in the file
+    attempts = 0
     while True:
         try:
+            # Check if the input file exists
+            if not os.path.exists(INPUT_FILE_PATH):
+                time.sleep(0.5)
+                continue
+                
+            # Read content from the file
             with open(INPUT_FILE_PATH, 'r') as f:
                 content = f.read().strip()
             
+            # Process if we have content
             if content:
-                # Clear the input file after reading
-                with open(INPUT_FILE_PATH, 'w') as f:
-                    pass
+                # Handle heartbeat messages
+                if content == "__HEARTBEAT__":
+                    # Clear the input file
+                    with open(INPUT_FILE_PATH, 'w') as f:
+                        pass
+                    # Skip this cycle
+                    time.sleep(0.1)
+                    continue
                 
                 print(f"Received input: {content}")
+                
+                # Clear the input file after reading
+                try:
+                    with open(INPUT_FILE_PATH, 'w') as f:
+                        pass
+                except Exception as clear_err:
+                    original_print(f"Error clearing input file: {clear_err}")
+                
+                # Write acknowledgment to output
+                try:
+                    with open(OUTPUT_FILE_PATH, 'a') as f:
+                        f.write(f"Processing your query: {content}\\n")
+                        f.flush()
+                except Exception as ack_err:
+                    original_print(f"Error writing acknowledgment: {ack_err}")
+                
                 return content
         except Exception as e:
-            print(f"Error reading input file: {e}")
+            print(f"Error reading input file (attempt {attempts}): {e}")
+            attempts += 1
+            if attempts >= 10:
+                print("Too many errors reading input file, resetting...")
+                attempts = 0
         
-        time.sleep(0.5)
+        # Check more frequently to be responsive
+        time.sleep(0.2)
 
 # Override print function to write to the output file
 original_print = print
