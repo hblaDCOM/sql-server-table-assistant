@@ -732,8 +732,8 @@ Schema retrieval encountered errors. Limited table information available:
     async def run(self):
         """Main entry point to run the chat session."""
         try:
-            # Initialize with MCP server - fix the dict has no attribute 'command' error
-            async with stdio_client() as (read, write):
+            # Initialize with MCP server - provide the required server parameter
+            async with stdio_client("mcp-server") as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     
