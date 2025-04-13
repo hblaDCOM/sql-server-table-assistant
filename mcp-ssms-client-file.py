@@ -732,8 +732,8 @@ Schema retrieval encountered errors. Limited table information available:
     async def run(self):
         """Main entry point to run the chat session."""
         try:
-            # Initialize with MCP server
-            async with stdio_client(server_params) as (read, write):
+            # Initialize with MCP server - fix the dict has no attribute 'command' error
+            async with stdio_client() as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     
@@ -744,6 +744,8 @@ Schema retrieval encountered errors. Limited table information available:
                     await self.chat_loop(session)
         except Exception as e:
             print(f"Error running chat: {e}")
+            import traceback
+            traceback.print_exc()
 
 # Main entry point
 if __name__ == "__main__":
