@@ -9,6 +9,7 @@ from mcp import ClientSession
 import asyncio
 import sys
 from openai import AzureOpenAI
+import time
 
 # Initialize OpenAI client
 client = AzureOpenAI(
@@ -54,7 +55,7 @@ def get_input(prompt):
                 return content
             
             # Sleep briefly to avoid CPU spinning
-            asyncio.sleep(0.1)
+            time.sleep(0.1)  # Use time.sleep instead of asyncio.sleep
         except Exception as e:
             print(f"Error reading input: {e}")
             return ""
