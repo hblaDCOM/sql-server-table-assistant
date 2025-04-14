@@ -5,8 +5,9 @@ import os
 import re
 import json
 import math
-from mcp import ClientSession, stdio_client
+from mcp import ClientSession
 import asyncio
+import sys
 from openai import AzureOpenAI
 
 # Initialize OpenAI client
@@ -19,12 +20,17 @@ client = AzureOpenAI(
 # Get the table name from environment variables or use a default
 FULLY_QUALIFIED_TABLE_NAME = os.getenv("SQL_TABLE_NAME", "dbo.YourTableName")
 
-# Define input/output file paths
-INPUT_FILE = os.getenv("MCP_INPUT_FILE", "input.txt")
-OUTPUT_FILE = os.getenv("MCP_OUTPUT_FILE", "output.txt")
+# Parse command line arguments for input/output files
+if len(sys.argv) >= 3:
+    INPUT_FILE = sys.argv[1]
+    OUTPUT_FILE = sys.argv[2]
+else:
+    # Default files if not provided
+    INPUT_FILE = os.getenv("MCP_INPUT_FILE", "input.txt")
+    OUTPUT_FILE = os.getenv("MCP_OUTPUT_FILE", "output.txt")
 
-# Server params for MCP connection
-server_params = {"stdio": True}
+print(f"Using input file: {INPUT_FILE}")
+print(f"Using output file: {OUTPUT_FILE}")
 
 # Function to read input from file - for file-based operation
 def get_input(prompt):
@@ -52,6 +58,48 @@ def get_input(prompt):
         except Exception as e:
             print(f"Error reading input: {e}")
             return ""
+
+# Simple mock ClientSession for file-based operation
+class FileBasedClientSession:
+    """A simple mock for ClientSession that works with files."""
+    
+    async def initialize(self):
+        """Initialize the session."""
+        print("File-based session initialized.")
+        
+    async def call_tool(self, tool_name, args):
+        """Call a tool by writing to output file and waiting for response."""
+        # Create a mock response class
+        class MockResponse:
+            def __init__(self, text):
+                self.content = [type('obj', (object,), {'text': text})]
+        
+        # Write tool call to output
+        with open(OUTPUT_FILE, "a") as f:
+            f.write(f"TOOL_CALL: {tool_name}\n")
+            f.write(f"ARGS: {json.dumps(args)}\n")
+            f.write("WAITING_FOR_TOOL_RESULT\n")
+        
+        # Wait for tool result in input file
+        last_modified = os.path.getmtime(INPUT_FILE) if os.path.exists(INPUT_FILE) else 0
+        while True:
+            try:
+                if os.path.exists(INPUT_FILE) and os.path.getmtime(INPUT_FILE) > last_modified:
+                    with open(INPUT_FILE, "r") as f:
+                        result = f.read().strip()
+                    
+                    # Clear the input file
+                    with open(INPUT_FILE, "w") as f:
+                        pass
+                    
+                    # Return mock response
+                    return MockResponse(result)
+                
+                # Sleep briefly to avoid CPU spinning
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                print(f"Error waiting for tool result: {e}")
+                return MockResponse(f"Error: {str(e)}")
 
 @dataclass
 class QueryIteration:
@@ -732,17 +780,15 @@ Schema retrieval encountered errors. Limited table information available:
     async def run(self):
         """Main entry point to run the chat session."""
         try:
-            # Initialize with file-based client for web server integration
-            # Use the server_params object properly
-            async with stdio_client(server_params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    
-                    # Fetch schema information before starting chat loop
-                    await self.fetch_schema(session)
-                    
-                    # Start the interactive chat loop
-                    await self.chat_loop(session)
+            # Use the FileBasedClientSession directly instead of stdio_client
+            session = FileBasedClientSession()
+            await session.initialize()
+            
+            # Fetch schema information before starting chat loop
+            await self.fetch_schema(session)
+            
+            # Start the interactive chat loop
+            await self.chat_loop(session)
         except Exception as e:
             print(f"Error running chat: {e}")
             import traceback
