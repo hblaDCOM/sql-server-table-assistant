@@ -3,42 +3,350 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SQL Server Table Assistant</title>
-    <link rel="stylesheet" href="/static/css/styles.css">
-    <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+    <title>SQL Assistant</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            background-color: #f8f9fa;
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            background-color: #343a40;
+            color: white;
+            padding: 20px 0;
+            margin-bottom: 20px;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 24px;
+        }
+        #results-container {
+            height: 500px;
+            overflow-y: auto;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            padding: 15px;
+            background-color: white;
+            margin-bottom: 15px;
+        }
+        #sql-container {
+            display: none;
+            margin-top: 20px;
+            padding: 15px;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            background-color: #f8f9fa;
+        }
+        #sql-query {
+            font-family: 'Consolas', 'Courier New', monospace;
+            background-color: #282c34;
+            color: #abb2bf;
+            padding: 10px;
+            border-radius: 5px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+        }
+        #action-buttons {
+            display: none;
+            margin-top: 15px;
+        }
+        #feedback-container {
+            display: none;
+            margin-top: 15px;
+        }
+        .loader {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(0,0,0,.1);
+            border-radius: 50%;
+            border-top-color: #007bff;
+            animation: spin 1s ease-in-out infinite;
+            margin-left: 10px;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .results-table {
+            width: 100%;
+            margin-bottom: 20px;
+            overflow-x: auto;
+        }
+        .results-table table {
+            border-collapse: collapse;
+            width: 100%;
+        }
+        .results-table th {
+            background-color: #f2f2f2;
+            font-weight: bold;
+            text-align: left;
+            padding: 8px;
+            border: 1px solid #ddd;
+        }
+        .results-table td {
+            padding: 8px;
+            border: 1px solid #ddd;
+        }
+        .results-table tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+        .explanation {
+            background-color: #e9f7fe;
+            border-left: 4px solid #3498db;
+            padding: 15px;
+            margin-top: 20px;
+            border-radius: 3px;
+        }
+        .preview-container {
+            margin-bottom: 30px;
+        }
+        .preview-heading {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+    </style>
 </head>
 <body>
-    <div class="chat-container">
-        <div class="header">
-            <h1>SQL Server Table Assistant</h1>
-            <div class="connection-status">
-                <span id="status-indicator"></span>
-                <span id="status-text">Connecting...</span>
-            </div>
-        </div>
-        
-        <div class="chat-messages" id="chat-messages">
-            <div class="message system">
-                <p>Welcome to the SQL Server Table Assistant. Type your natural language question about the table below.</p>
-            </div>
-        </div>
-        
-        <div class="chat-input">
-            <input type="text" id="user-input" placeholder="Ask a question about your data...">
-            <button id="send-button">Send</button>
-        </div>
-        
-        <div class="special-commands">
-            <p>Special commands:</p>
-            <ul>
-                <li><code>/diagnose</code> - Run diagnostics</li>
-                <li><code>/refresh_schema</code> - Refresh table schema</li>
-                <li><code>/history</code> - View query history</li>
-                <li><code>/show-logs [n]</code> - View recent query logs</li>
-            </ul>
+    <div class="header">
+        <div class="container">
+            <h1>SQL Table Assistant</h1>
+            <small id="table-name" class="text-light"></small>
         </div>
     </div>
     
-    <script src="/static/js/app.js"></script>
+    <div class="container">
+        <div id="loading" class="text-center mb-4" style="display:none;">
+            <div class="spinner-border text-primary" role="status">
+                <span class="visually-hidden">Loading...</span>
+            </div>
+            <p>Connecting to database and loading table data...</p>
+        </div>
+        
+        <div id="error-alert" class="alert alert-danger" style="display:none;"></div>
+        
+        <div id="preview-container" class="preview-container">
+            <div class="preview-heading">
+                <h3>Data Preview</h3>
+                <span class="badge bg-secondary">Top 5 rows</span>
+            </div>
+            <div id="table-preview" class="results-table"></div>
+        </div>
+        
+        <div class="mb-4">
+            <h3>Ask a Question</h3>
+            <div class="input-group">
+                <input type="text" id="query-input" class="form-control" placeholder="Ask a question about your data...">
+                <button id="send-btn" class="btn btn-primary">Send</button>
+            </div>
+        </div>
+        
+        <div id="sql-container">
+            <h4>Generated SQL Query</h4>
+            <pre id="sql-query"></pre>
+            <div id="action-buttons">
+                <button id="execute-btn" class="btn btn-success me-2">Execute Query</button>
+                <button id="refine-btn" class="btn btn-primary me-2">Refine Query</button>
+                <button id="cancel-btn" class="btn btn-secondary">Cancel</button>
+            </div>
+            <div id="feedback-container">
+                <textarea id="feedback-text" class="form-control mb-2" rows="3" placeholder="Enter your feedback to improve the SQL query..."></textarea>
+                <button id="submit-feedback-btn" class="btn btn-primary">Submit Feedback</button>
+                <button id="cancel-feedback-btn" class="btn btn-secondary ms-2">Cancel</button>
+            </div>
+        </div>
+        
+        <div id="results-container" style="display:none;">
+            <h4>Query Results</h4>
+            <div id="results-message" class="alert alert-success mb-3"></div>
+            <div id="results-data" class="results-table"></div>
+            <div id="results-explanation" class="explanation"></div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.socket.io/4.4.1/socket.io.min.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const socket = io();
+            let currentQuery = '';
+            let currentSql = '';
+            
+            // UI Elements
+            const queryInput = document.getElementById('query-input');
+            const sendBtn = document.getElementById('send-btn');
+            const sqlContainer = document.getElementById('sql-container');
+            const sqlQuery = document.getElementById('sql-query');
+            const actionButtons = document.getElementById('action-buttons');
+            const executeBtn = document.getElementById('execute-btn');
+            const refineBtn = document.getElementById('refine-btn');
+            const cancelBtn = document.getElementById('cancel-btn');
+            const feedbackContainer = document.getElementById('feedback-container');
+            const feedbackText = document.getElementById('feedback-text');
+            const submitFeedbackBtn = document.getElementById('submit-feedback-btn');
+            const cancelFeedbackBtn = document.getElementById('cancel-feedback-btn');
+            const resultsContainer = document.getElementById('results-container');
+            const resultsMessage = document.getElementById('results-message');
+            const resultsData = document.getElementById('results-data');
+            const resultsExplanation = document.getElementById('results-explanation');
+            const errorAlert = document.getElementById('error-alert');
+            const tablePreview = document.getElementById('table-preview');
+            const tableName = document.getElementById('table-name');
+            const loadingIndicator = document.getElementById('loading');
+            
+            // Show loading indicator on startup
+            loadingIndicator.style.display = 'block';
+            
+            // Socket events
+            socket.on('connect', function() {
+                console.log('Connected to server');
+            });
+            
+            socket.on('initial_data', function(data) {
+                loadingIndicator.style.display = 'none';
+                console.log('Received initial data', data);
+                
+                // Display table name
+                tableName.textContent = data.table_name;
+                
+                // Display data preview
+                if (data.preview) {
+                    tablePreview.innerHTML = data.preview;
+                } else {
+                    tablePreview.innerHTML = '<p>No preview data available</p>';
+                }
+            });
+            
+            socket.on('initialization_error', function(data) {
+                loadingIndicator.style.display = 'none';
+                showError(data.error);
+            });
+            
+            socket.on('sql_generated', function(data) {
+                console.log('SQL generated:', data.sql);
+                
+                // Display the SQL query
+                sqlQuery.textContent = data.sql;
+                currentSql = data.sql;
+                
+                // Show the SQL container and action buttons
+                sqlContainer.style.display = 'block';
+                actionButtons.style.display = 'block';
+                feedbackContainer.style.display = 'none';
+            });
+            
+            socket.on('query_results', function(data) {
+                console.log('Query results:', data);
+                
+                // Display results
+                resultsContainer.style.display = 'block';
+                resultsMessage.textContent = data.results.message;
+                
+                if (data.results.data) {
+                    resultsData.innerHTML = data.results.data;
+                } else {
+                    resultsData.innerHTML = '<p>No data returned</p>';
+                }
+                
+                if (data.explanation) {
+                    resultsExplanation.innerHTML = data.explanation;
+                    resultsExplanation.style.display = 'block';
+                } else {
+                    resultsExplanation.style.display = 'none';
+                }
+                
+                // Scroll to results
+                resultsContainer.scrollIntoView({ behavior: 'smooth' });
+            });
+            
+            socket.on('error', function(data) {
+                console.error('Error:', data.error);
+                showError(data.error);
+            });
+            
+            // UI Event handlers
+            sendBtn.addEventListener('click', function() {
+                const query = queryInput.value.trim();
+                if (!query) return;
+                
+                // Reset the UI
+                resultsContainer.style.display = 'none';
+                sqlContainer.style.display = 'none';
+                errorAlert.style.display = 'none';
+                
+                // Save current query
+                currentQuery = query;
+                
+                // Send query to server
+                socket.emit('query', { query: query });
+            });
+            
+            queryInput.addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    sendBtn.click();
+                }
+            });
+            
+            executeBtn.addEventListener('click', function() {
+                // Execute the SQL query
+                socket.emit('execute', { 
+                    sql: currentSql,
+                    original_query: currentQuery
+                });
+            });
+            
+            refineBtn.addEventListener('click', function() {
+                // Show feedback form
+                actionButtons.style.display = 'none';
+                feedbackContainer.style.display = 'block';
+                feedbackText.focus();
+            });
+            
+            cancelBtn.addEventListener('click', function() {
+                // Cancel the SQL query
+                sqlContainer.style.display = 'none';
+            });
+            
+            submitFeedbackBtn.addEventListener('click', function() {
+                const feedback = feedbackText.value.trim();
+                if (!feedback) return;
+                
+                // Send feedback to server
+                socket.emit('refine_sql', {
+                    current_sql: currentSql,
+                    feedback: feedback
+                });
+                
+                // Reset feedback form
+                feedbackText.value = '';
+                feedbackContainer.style.display = 'none';
+            });
+            
+            cancelFeedbackBtn.addEventListener('click', function() {
+                // Cancel feedback
+                feedbackContainer.style.display = 'none';
+                actionButtons.style.display = 'block';
+            });
+            
+            function showError(message) {
+                errorAlert.textContent = message;
+                errorAlert.style.display = 'block';
+                
+                // Hide after 5 seconds
+                setTimeout(() => {
+                    errorAlert.style.display = 'none';
+                }, 5000);
+            }
+        });
+    </script>
 </body>
 </html> 
