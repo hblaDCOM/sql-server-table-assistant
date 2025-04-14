@@ -54,18 +54,25 @@ def get_input(prompt):
     # Print the prompt to output file WITHOUT waiting tag
     with open(OUTPUT_FILE, "a") as f:
         f.write(f"{prompt}\n")
+        # Force flush to ensure content is written immediately
+        f.flush()
     
     print(f"Waiting for user input: {prompt}")
     
     # Flag file approach - write a flag file that the web server will check
     flag_file = f"{INPUT_FILE}.waiting"
-    with open(flag_file, "w") as f:
-        f.write("waiting for input")
+    try:
+        with open(flag_file, "w") as f:
+            f.write("waiting for input")
+            f.flush()
+    except Exception as e:
+        print(f"Error creating flag file: {e}")
     
     # Wait for input in the input file
     last_modified = os.path.getmtime(INPUT_FILE) if os.path.exists(INPUT_FILE) else 0
     timeout_seconds = 300  # 5 minute timeout
     start_time = time.time()
+    last_check_time = time.time()
     
     # Single attempt to read existing content
     if os.path.exists(INPUT_FILE):
@@ -74,15 +81,21 @@ def get_input(prompt):
                 content = f.read().strip()
             
             if content and content != "__HEARTBEAT__":
+                print(f"Found existing input: {content[:30]}..." if len(content) > 30 else f"Found existing input: {content}")
+                
                 # Clear the file after reading
                 with open(INPUT_FILE, "w") as f:
-                    pass
+                    f.write("")
+                    f.flush()
                 
                 # Clear the flag file
                 if os.path.exists(flag_file):
-                    os.remove(flag_file)
+                    try:
+                        os.remove(flag_file)
+                    except:
+                        pass
                     
-                print(f"Input received: {content[:30]}..." if len(content) > 30 else f"Input received: {content}")
+                print(f"Input received immediately: {content[:30]}..." if len(content) > 30 else f"Input received immediately: {content}")
                 return content
         except Exception as e:
             print(f"Error reading initial input: {e}")
@@ -90,46 +103,70 @@ def get_input(prompt):
     # Now wait for new content
     while True:
         try:
-            # Check if file exists and has been modified
-            if os.path.exists(INPUT_FILE):
-                current_mod_time = os.path.getmtime(INPUT_FILE)
-                if current_mod_time > last_modified:
-                    with open(INPUT_FILE, "r") as f:
-                        content = f.read().strip()
-                    
-                    # Skip heartbeat messages
-                    if content == "__HEARTBEAT__":
-                        last_modified = current_mod_time
-                        continue
-                    
-                    # Only clear the file if we got real content
-                    if content:
-                        with open(INPUT_FILE, "w") as f:
-                            pass
-                        
-                        # Clear the flag file
-                        if os.path.exists(flag_file):
-                            os.remove(flag_file)
-                            
-                        print(f"Input received: {content[:30]}..." if len(content) > 30 else f"Input received: {content}")
-                        return content
+            # Only check at reasonable intervals to reduce file operations
+            current_time = time.time()
+            if current_time - last_check_time < 0.5:
+                time.sleep(0.1)
+                continue
+                
+            last_check_time = current_time
+            
+            # Check if file exists
+            if not os.path.exists(INPUT_FILE):
+                continue
+                
+            # Check file content
+            with open(INPUT_FILE, "r") as f:
+                content = f.read().strip()
+            
+            # Check if content is valid
+            if not content:
+                continue
+                
+            # Skip heartbeat messages
+            if content == "__HEARTBEAT__":
+                with open(INPUT_FILE, "w") as f:
+                    f.write("")
+                    f.flush()
+                continue
+            
+            # Valid content received
+            with open(INPUT_FILE, "w") as f:
+                f.write("")
+                f.flush()
+            
+            # Clear the flag file
+            if os.path.exists(flag_file):
+                try:
+                    os.remove(flag_file)
+                except:
+                    pass
+                
+            print(f"Input received: {content[:30]}..." if len(content) > 30 else f"Input received: {content}")
+            
+            # Confirm processing to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\nReceived input: {content[:30]}...\n" if len(content) > 30 else f"\nReceived input: {content}\n")
+                f.write("Processing your query...\n")
+                f.flush()
+                
+            return content
             
             # Check for timeout
             if time.time() - start_time > timeout_seconds:
                 print("Timeout waiting for user input")
                 # Clear the flag file
                 if os.path.exists(flag_file):
-                    os.remove(flag_file)
+                    try:
+                        os.remove(flag_file)
+                    except:
+                        pass
                 return "/exit"  # Exit if timeout
             
-            # Sleep briefly to avoid CPU spinning
-            time.sleep(0.5)
         except Exception as e:
             print(f"Error reading input: {e}")
-            # Clear the flag file
-            if os.path.exists(flag_file):
-                os.remove(flag_file)
-            return ""
+            # Brief pause to prevent tight loop on persistent errors
+            time.sleep(0.5)
 
 # Simple mock ClientSession for file-based operation
 class FileBasedClientSession:
@@ -149,7 +186,7 @@ class FileBasedClientSession:
             def __init__(self, text):
                 self.content = [type('obj', (object,), {'text': text})]
         
-        # Log more details for SQL queries to help with debugging
+        # Debug output to console
         if tool_name == "query_table" and "sql" in args:
             print(f"Executing SQL query: {args['sql']}")
             
@@ -159,6 +196,7 @@ class FileBasedClientSession:
                 f.write(f"{args['sql']}\n")
                 f.write("---------------------------\n")
                 f.write("WAITING_FOR_RESULT\n")
+                f.flush()
         elif tool_name == "test_connection":
             print(f"Testing SQL Server connection")
             
@@ -167,6 +205,7 @@ class FileBasedClientSession:
                 f.write(f"\n--- Testing SQL Server Connection ---\n")
                 f.write("Attempting to connect to SQL Server to verify connectivity...\n")
                 f.write("WAITING_FOR_RESULT\n")
+                f.flush()
         else:
             # Write generic tool call to output
             print(f"Calling tool: {tool_name}")
@@ -174,28 +213,67 @@ class FileBasedClientSession:
                 f.write(f"\nTOOL_CALL: {tool_name}\n")
                 f.write(f"ARGS: {json.dumps(args)}\n")
                 f.write("WAITING_FOR_TOOL_RESULT\n")
+                f.flush()
         
         # Flag file approach - write a flag file that the web server will check
         flag_file = f"{INPUT_FILE}.waiting_tool"
-        with open(flag_file, "w") as f:
-            f.write(f"waiting for tool result: {tool_name}")
+        try:
+            with open(flag_file, "w") as f:
+                f.write(f"waiting for tool result: {tool_name}")
+                f.flush()
+        except Exception as e:
+            print(f"Error creating tool flag file: {e}")
         
         # Wait for tool result in input file
         print(f"Waiting for result of tool call: {tool_name}")
         
-        # Track file modification time
-        last_modified = os.path.getmtime(INPUT_FILE) if os.path.exists(INPUT_FILE) else 0
-        timeout_seconds = 60  # 1 minute timeout
+        # Set up timeout handling
+        timeout_seconds = 45  # Reduced timeout to 45 seconds
         start_time = time.time()
         last_progress_time = time.time()
+        last_check_time = time.time()
         
         # For timeout tracking
         last_progress_msg = ""
         
+        # First check - does input file already have a response?
+        try:
+            if os.path.exists(INPUT_FILE):
+                with open(INPUT_FILE, "r") as f:
+                    result = f.read().strip()
+                
+                if result and result != "__HEARTBEAT__":
+                    print(f"Found immediate result for {tool_name}")
+                    
+                    # Clear the input file
+                    with open(INPUT_FILE, "w") as f:
+                        f.write("")
+                        f.flush()
+                    
+                    # Clear the flag file
+                    if os.path.exists(flag_file):
+                        try:
+                            os.remove(flag_file)
+                        except:
+                            pass
+                    
+                    # Process the result
+                    return MockResponse(result)
+        except Exception as e:
+            print(f"Error checking for immediate result: {e}")
+        
+        # Main waiting loop
         while True:
             try:
-                # Print a progress message every 5 seconds to show we're still alive
+                # Only check at reasonable intervals to reduce file operations
                 current_time = time.time()
+                if current_time - last_check_time < 0.3:  # Faster checks for more responsiveness
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                last_check_time = current_time
+                
+                # Print a progress message every 5 seconds to show we're still alive
                 if current_time - last_progress_time > 5:
                     elapsed = int(current_time - start_time)
                     progress_msg = f"Still waiting for {tool_name} after {elapsed} seconds..."
@@ -205,34 +283,52 @@ class FileBasedClientSession:
                     if progress_msg != last_progress_msg:
                         with open(OUTPUT_FILE, "a") as f:
                             f.write(f"\n{progress_msg}\n")
+                            f.flush()
                         last_progress_msg = progress_msg
                         
                     last_progress_time = current_time
                 
-                # Check if file exists and has been modified
-                if os.path.exists(INPUT_FILE):
-                    current_mod_time = os.path.getmtime(INPUT_FILE)
-                    if current_mod_time > last_modified:
-                        with open(INPUT_FILE, "r") as f:
-                            result = f.read().strip()
-                        
-                        # Handle heartbeat messages
-                        if result == "__HEARTBEAT__":
-                            last_modified = current_mod_time
-                            continue
-                            
-                        # Only clear the file if we got some content
-                        if result:
-                            print(f"Received result for {tool_name} tool call after {int(time.time() - start_time)} seconds")
-                            with open(INPUT_FILE, "w") as f:
-                                pass
-                            
-                            # Clear the flag file
-                            if os.path.exists(flag_file):
-                                os.remove(flag_file)
-                                
-                            # Return mock response with result
-                            return MockResponse(result)
+                # Check if file exists
+                if not os.path.exists(INPUT_FILE):
+                    continue
+                
+                # Read the input file
+                with open(INPUT_FILE, "r") as f:
+                    result = f.read().strip()
+                
+                # Skip if empty or heartbeat
+                if not result:
+                    continue
+                
+                # Handle heartbeat messages
+                if result == "__HEARTBEAT__":
+                    with open(INPUT_FILE, "w") as f:
+                        f.write("")
+                        f.flush()
+                    continue
+                
+                # Process valid result
+                print(f"Received result for {tool_name} tool call after {int(time.time() - start_time)} seconds")
+                
+                # Clear the input file
+                with open(INPUT_FILE, "w") as f:
+                    f.write("")
+                    f.flush()
+                
+                # Clear the flag file
+                if os.path.exists(flag_file):
+                    try:
+                        os.remove(flag_file)
+                    except:
+                        pass
+                
+                # Send confirmation to output
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"\nReceived response for {tool_name}\n")
+                    f.flush()
+                
+                # Return mock response with result
+                return MockResponse(result)
                 
                 # Check for timeout
                 if time.time() - start_time > timeout_seconds:
@@ -241,36 +337,51 @@ class FileBasedClientSession:
                     
                     # Clear the flag file
                     if os.path.exists(flag_file):
-                        os.remove(flag_file)
+                        try:
+                            os.remove(flag_file)
+                        except:
+                            pass
+                    
+                    # Write timeout to output file
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write(f"\n{error_msg}\n")
+                        f.write("The operation may still be processing on the server.\n")
+                        f.flush()
                     
                     # Special handling for different tools
                     if tool_name == "test_connection":
                         return MockResponse("Connection failed: Timeout while waiting for SQL Server response. This typically indicates network connectivity issues or that the SQL Server is unreachable.")
                     elif tool_name == "get_table_schema":
-                        return MockResponse("Error retrieving schema: Connection timed out after 60 seconds. Please check SQL Server connectivity and that the table exists.")
+                        return MockResponse("Error retrieving schema: Connection timed out after 45 seconds. Please check SQL Server connectivity and that the table exists.")
                     elif tool_name == "query_table":
-                        return MockResponse(f"Error: SQL query execution timed out after 60 seconds. The query may be too complex or the server may be unresponsive.\nQuery: {args.get('sql', 'Unknown')}")
+                        return MockResponse(f"Error: SQL query execution timed out after 45 seconds. The query may be too complex or the server may be unresponsive.\nQuery: {args.get('sql', 'Unknown')}")
                     else:
                         return MockResponse(f"Error: Timeout waiting for {tool_name} result")
                 
-                # Sleep briefly to avoid CPU spinning
-                await asyncio.sleep(0.5)
             except Exception as e:
                 print(f"Error waiting for tool result: {e}")
                 
-                # Clear the flag file
-                if os.path.exists(flag_file):
-                    os.remove(flag_file)
+                # Brief pause on errors
+                await asyncio.sleep(0.5)
                 
-                # Special handling for different tools
-                if tool_name == "test_connection":
-                    return MockResponse(f"Connection failed: An error occurred: {str(e)}")
-                elif tool_name == "get_table_schema":
-                    return MockResponse(f"Error retrieving schema: {str(e)}")
-                elif tool_name == "query_table":
-                    return MockResponse(f"Error: SQL query execution failed: {str(e)}\nQuery: {args.get('sql', 'Unknown')}")
-                else:
-                    return MockResponse(f"Error: {str(e)}")
+                # Only fail after multiple retries
+                if time.time() - start_time > 10:  # Give at least 10 seconds before giving up
+                    # Clear the flag file
+                    if os.path.exists(flag_file):
+                        try:
+                            os.remove(flag_file)
+                        except:
+                            pass
+                    
+                    # Special handling for different tools
+                    if tool_name == "test_connection":
+                        return MockResponse(f"Connection failed: An error occurred: {str(e)}")
+                    elif tool_name == "get_table_schema":
+                        return MockResponse(f"Error retrieving schema: {str(e)}")
+                    elif tool_name == "query_table":
+                        return MockResponse(f"Error: SQL query execution failed: {str(e)}\nQuery: {args.get('sql', 'Unknown')}")
+                    else:
+                        return MockResponse(f"Error: {str(e)}")
 
 @dataclass
 class QueryIteration:
@@ -570,6 +681,12 @@ Schema retrieval encountered errors. Limited table information available:
         """Process a natural language query, generate SQL, and execute it with user approval."""
         print(f"\nProcessing query: {query}")
         
+        # Write processing acknowledgement to output
+        with open(OUTPUT_FILE, "a") as f:
+            f.write(f"\nProcessing your query: {query}\n")
+            f.write("Generating SQL query...\n")
+            f.flush()
+        
         # Reset query iterations for new query
         self.current_query_iterations = []
         
@@ -579,10 +696,28 @@ Schema retrieval encountered errors. Limited table information available:
         self.messages.append({"role": "user", "content": query})
         
         # Generate SQL (first iteration)
-        await self.generate_sql_iteration(session, query)
+        try:
+            await self.generate_sql_iteration(session, query)
+        except Exception as e:
+            print(f"Error generating SQL: {e}")
+            import traceback
+            traceback.print_exc()
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\nError generating SQL: {str(e)}\n")
+                f.write("Please try rephrasing your query.\n")
+                f.flush()
+            return
         
         # Main query refinement loop
         while True:
+            if not self.current_query_iterations:
+                print("No SQL iterations generated")
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write("\nFailed to generate SQL for your query.\n")
+                    f.write("Please try rephrasing your question.\n")
+                    f.flush()
+                return
+                
             current_iteration = self.current_query_iterations[-1]
             
             # Display the generated SQL
@@ -590,25 +725,58 @@ Schema retrieval encountered errors. Limited table information available:
             print(current_iteration.generated_sql)
             print("===============================")
             
+            # Write SQL to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n===== GENERATED SQL QUERY =====\n")
+                f.write(f"{current_iteration.generated_sql}\n")
+                f.write("===============================\n\n")
+                f.write("Do you want to (e)xecute this query, provide (f)eedback to refine it, or (c)ancel? (e/f/c): ")
+                f.flush()
+            
             # Get user decision - wait for execute, refine, or cancel
             print("\nDo you want to (e)xecute this query, provide (f)eedback to refine it, or (c)ancel? (e/f/c): ")
             decision = get_input("").strip().lower()
             
             if decision == 'c':
                 print("Query canceled.")
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write("\nQuery canceled.\n")
+                    f.flush()
                 break
             
             elif decision == 'f':
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write("\nEnter your feedback for improving the SQL query: ")
+                    f.flush()
+                    
                 feedback = get_input("Enter your feedback for improving the SQL query: ")
                 current_iteration.feedback = feedback
                 
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"\nRefining SQL with feedback: {feedback}\n")
+                    f.write("Generating improved SQL...\n")
+                    f.flush()
+                
                 # Generate new SQL iteration based on feedback
-                await self.generate_sql_iteration(session, query, feedback)
+                try:
+                    await self.generate_sql_iteration(session, query, feedback)
+                except Exception as e:
+                    print(f"Error generating refined SQL: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write(f"\nError generating refined SQL: {str(e)}\n")
+                        f.write("Please try providing different feedback or executing the current query.\n")
+                        f.flush()
                 continue
             
             elif decision == 'e':
                 # Execute the query
                 current_iteration.executed = True
+                
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write("\nExecuting SQL query...\n")
+                    f.flush()
                 
                 try:
                     # Detect if this is likely a calculation/percentage query
@@ -654,6 +822,10 @@ Schema retrieval encountered errors. Limited table information available:
                         safe_result_summary += "\n\n[JSON data omitted for calculation query]"
                     
                     try:
+                        with open(OUTPUT_FILE, "a") as f:
+                            f.write("\nSaving query log...\n")
+                            f.flush()
+                            
                         log_result = await session.call_tool("save_query_log", {
                             "natural_language_query": query,
                             "sql_query": current_iteration.generated_sql,
@@ -662,8 +834,16 @@ Schema retrieval encountered errors. Limited table information available:
                         })
                         log_message = getattr(log_result.content[0], "text", "")
                         print(f"\n{log_message}")
+                        
+                        with open(OUTPUT_FILE, "a") as f:
+                            f.write(f"\n{log_message}\n")
+                            f.flush()
                     except Exception as log_err:
                         print(f"Error saving query log: {log_err}")
+                        with open(OUTPUT_FILE, "a") as f:
+                            f.write(f"\nError saving query log: {str(log_err)}\n")
+                            f.flush()
+                            
                         # Try with a more minimal result summary if the first attempt failed
                         try:
                             minimal_summary = f"Query executed successfully. Results not logged due to serialization issues."
@@ -674,6 +854,10 @@ Schema retrieval encountered errors. Limited table information available:
                                 "iterations": iterations_data
                             })
                             print("Query log saved with minimal results due to serialization issues.")
+                            
+                            with open(OUTPUT_FILE, "a") as f:
+                                f.write("\nQuery log saved with minimal results due to serialization issues.\n")
+                                f.flush()
                         except Exception as retry_err:
                             print(f"Failed to save query log even with minimal results: {retry_err}")
                     
@@ -689,6 +873,10 @@ Schema retrieval encountered errors. Limited table information available:
                     
                     # Generate natural language explanation of results, but with fewer tokens
                     # Use the dedicated explanation system prompt
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write("\nGenerating explanation of results...\n")
+                        f.flush()
+                        
                     await self.generate_result_explanation(session, query, current_iteration.generated_sql, result_text)
                     
                 except Exception as e:
@@ -696,24 +884,50 @@ Schema retrieval encountered errors. Limited table information available:
                     print(f"\n===== QUERY ERROR =====")
                     print(error_message)
                     print("========================\n")
+                    
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write(f"\n===== QUERY ERROR =====\n")
+                        f.write(f"{error_message}\n")
+                        f.write("========================\n")
+                        f.flush()
+                        
                     self.messages.append({"role": "system", "content": error_message})
                 
                 break
             
             else:
                 print(f"Invalid choice: {decision}. Please enter 'e' to execute, 'f' for feedback, or 'c' to cancel.")
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"\nInvalid choice: {decision}. Please enter 'e' to execute, 'f' for feedback, or 'c' to cancel.\n")
+                    f.write("Do you want to (e)xecute this query, provide (f)eedback to refine it, or (c)ancel? (e/f/c): ")
+                    f.flush()
 
     def display_query_results(self, result_text: str) -> None:
         """Extract and display the tabular results from the query execution."""
         print("\n===== QUERY RESULTS =====")
         
+        # Write to output file
+        with open(OUTPUT_FILE, "a") as f:
+            f.write("\n===== QUERY RESULTS =====\n")
+            f.flush()
+        
         if result_text.startswith("Error:"):
             print(result_text)
+            # Write error to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"{result_text}\n")
+                f.write("========================\n")
+                f.flush()
             return
         
         # Split off JSON data if present
         display_text = result_text.split("\n\nJSON_DATA:")[0] if "JSON_DATA:" in result_text else result_text
         print(display_text)
+        
+        # Write results to output file
+        with open(OUTPUT_FILE, "a") as f:
+            f.write(f"{display_text}\n")
+            f.flush()
         
         # Extract JSON data for potential programmatic use
         if "JSON_DATA:" in result_text:
@@ -723,6 +937,11 @@ Schema retrieval encountered errors. Limited table information available:
                 json_data = json.loads(json_str)
             except json.JSONDecodeError as e:
                 print(f"\nWarning: Could not parse JSON results: {str(e)}")
+                # Write warning to output file
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"\nWarning: Could not parse JSON results: {str(e)}\n")
+                    f.flush()
+                
                 # Try to extract the JSON data with manual processing if the automatic parsing failed
                 try:
                     # This is a fallback for when standard JSON parsing fails
@@ -731,11 +950,27 @@ Schema retrieval encountered errors. Limited table information available:
                     json_str = json_str.replace('NaN', '"NaN"').replace('Infinity', '"Infinity"').replace('-Infinity', '"-Infinity"')
                     json_data = json.loads(json_str)
                     print("Successfully recovered JSON data with fallback method.")
+                    
+                    # Write success to output file
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write("Successfully recovered JSON data with fallback method.\n")
+                        f.flush()
                 except Exception as deep_error:
                     print(f"Failed to recover JSON data: {deep_error}")
+                    
+                    # Write error to output file
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write(f"Failed to recover JSON data: {deep_error}\n")
+                        f.flush()
         
         print("==========================\n")
-    
+        
+        # Write closing block to output file
+        with open(OUTPUT_FILE, "a") as f:
+            f.write("==========================\n\n")
+            f.write("Enter your next query, or type /exit to quit: ")
+            f.flush()
+
     async def generate_sql_iteration(self, session: ClientSession, original_query: str, feedback: str = None) -> None:
         """Generate a SQL query iteration based on the original query and optional feedback."""
         iteration_number = len(self.current_query_iterations) + 1
@@ -829,7 +1064,7 @@ Schema retrieval encountered errors. Limited table information available:
             self.current_query_iterations.append(iteration)
     
     async def generate_result_explanation(self, session: ClientSession, 
-                                         query: str, sql: str, results: str) -> None:
+                                     query: str, sql: str, results: str) -> None:
         """Generate a natural language explanation of the query results with minimal tokens."""
         # Check cache first
         cache_key = f"explanation:{hash(results)}"
@@ -838,8 +1073,21 @@ Schema retrieval encountered errors. Limited table information available:
             print("\n===== RESULT EXPLANATION =====")
             print(explanation)
             print("==============================\n")
+            
+            # Write to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n===== RESULT EXPLANATION =====\n")
+                f.write(explanation + "\n")
+                f.write("==============================\n\n")
+                f.flush()
+                
             self.messages.append({"role": "assistant", "content": explanation})
             return
+            
+        # Write to output file that we're generating an explanation
+        with open(OUTPUT_FILE, "a") as f:
+            f.write("\nGenerating explanation of results...\n")
+            f.flush()
             
         # Extract just the tabular part for the explanation (without the JSON)
         # And limit the size to reduce token usage
@@ -883,10 +1131,27 @@ Schema retrieval encountered errors. Limited table information available:
             print(explanation)
             print("==============================\n")
             
+            # Write explanation to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n===== RESULT EXPLANATION =====\n")
+                f.write(explanation + "\n")
+                f.write("==============================\n\n")
+                f.write("Enter your next query, or type /exit to quit: ")
+                f.flush()
+            
             # Add explanation to conversation history
             self.messages.append({"role": "assistant", "content": explanation})
         except Exception as e:
-            print(f"Error generating result explanation: {str(e)}") 
+            print(f"Error generating result explanation: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+            # Write error to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\nError generating result explanation: {str(e)}\n")
+                f.write("Please try with a different query.\n")
+                f.write("Enter your next query, or type /exit to quit: ")
+                f.flush()
 
     async def show_query_history(self):
         """Display the history of queries executed in this session."""
@@ -953,7 +1218,8 @@ Schema retrieval encountered errors. Limited table information available:
         # Write initial welcome message to output
         with open(OUTPUT_FILE, "w") as f:
             f.write(f"\nTable Assistant is ready. You are working with table: {FULLY_QUALIFIED_TABLE_NAME}\n")
-            f.write("A data preview has been displayed above to verify the database connection.\n")
+            f.write("A data preview has been requested to verify the database connection.\n")
+            f.write("This will appear above when the connection is established.\n\n")
             f.write("Type your questions about the table in natural language, and I'll translate them to SQL.\n")
             f.write("Special commands:\n")
             f.write("  /diagnose - Run diagnostics\n")
@@ -961,9 +1227,11 @@ Schema retrieval encountered errors. Limited table information available:
             f.write("  /preview - Show data preview again\n")
             f.write("  /history - View query history\n")
             f.write("  /show-logs [n] - View recent query logs (default: 5)\n\n")
+            f.write("Waiting for your first query...\n")
+            f.flush()
         
         print(f"\nTable Assistant is ready. You are working with table: {FULLY_QUALIFIED_TABLE_NAME}")
-        print("A data preview has been displayed above to verify the database connection.")
+        print("A data preview has been requested to verify the database connection.")
         print("Type your questions about the table in natural language, and I'll translate them to SQL.")
         print("Special commands:")
         print("  /diagnose - Run diagnostics")
@@ -971,6 +1239,11 @@ Schema retrieval encountered errors. Limited table information available:
         print("  /preview - Show data preview again")
         print("  /history - View query history")
         print("  /show-logs [n] - View recent query logs (default: 5)")
+        
+        # Ping back to the web server
+        with open(OUTPUT_FILE, "a") as f:
+            f.write("\nEnter your Query (or type /exit to quit): ")
+            f.flush()
         
         while True:
             try:
@@ -990,6 +1263,7 @@ Schema retrieval encountered errors. Limited table information available:
                     # Write exit message to output file
                     with open(OUTPUT_FILE, "a") as f:
                         f.write("\nExiting SQL Assistant...\n")
+                        f.flush()
                     break
                     
                 # Process special commands
@@ -1020,14 +1294,32 @@ Schema retrieval encountered errors. Limited table information available:
                 # Process regular queries - write to output file first to confirm receipt
                 with open(OUTPUT_FILE, "a") as f:
                     f.write(f"\nProcessing: {query}\n")
+                    f.write("Generating SQL query...\n")
+                    f.flush()
                 
                 # Process the query
-                await self.process_query(session, query)
+                try:
+                    await self.process_query(session, query)
+                except Exception as query_err:
+                    print(f"Error processing query: {query_err}")
+                    import traceback
+                    traceback.print_exc()
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write(f"\nError processing query: {str(query_err)}\n")
+                        f.write("Please try again with a different query.\n")
+                        f.flush()
                 
             except Exception as e:
                 print(f"Error in chat loop: {e}")
                 import traceback
                 traceback.print_exc()
+                
+                # Write error to output file
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"\nError in chat loop: {str(e)}\n")
+                    f.write("Please try again.\n")
+                    f.flush()
+                
                 # Sleep briefly to avoid busy-waiting in case of persistent errors
                 await asyncio.sleep(1)
 
