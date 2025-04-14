@@ -1315,15 +1315,15 @@ Schema retrieval encountered errors. Limited table information available:
             missing_vars.append("MSSQL_DRIVER")
         
         if missing_vars:
-            print(f"\n❌ ERROR: Missing required environment variables: {', '.join(missing_vars)}")
+            print(f"\n[ERROR] Missing required environment variables: {', '.join(missing_vars)}")
             with open(OUTPUT_FILE, "a") as f:
-                f.write(f"\n❌ ERROR: Missing required environment variables: {', '.join(missing_vars)}\n")
+                f.write(f"\n[ERROR] Missing required environment variables: {', '.join(missing_vars)}\n")
                 f.write("These variables must be set in your .env file or environment.\n")
                 f.flush()
         else:
-            print("\n✅ All required environment variables are set")
+            print("\n[OK] All required environment variables are set")
             with open(OUTPUT_FILE, "a") as f:
-                f.write("\n✅ All required environment variables are set\n")
+                f.write("\n[OK] All required environment variables are set\n")
                 f.flush()
         
         # Check for ODBC drivers
@@ -1343,31 +1343,31 @@ Schema retrieval encountered errors. Limited table information available:
             # Check if our driver is available
             driver_name = MSSQL_DRIVER.strip("{}")
             if driver_name in drivers:
-                print(f"\n✅ Configured driver '{driver_name}' is available")
+                print(f"\n[OK] Configured driver '{driver_name}' is available")
                 with open(OUTPUT_FILE, "a") as f:
-                    f.write(f"\n✅ Configured driver '{driver_name}' is available\n")
+                    f.write(f"\n[OK] Configured driver '{driver_name}' is available\n")
                     f.flush()
             elif any('SQL Server' in driver for driver in drivers):
-                print(f"\n⚠️ Configured driver '{driver_name}' not found, but other SQL Server drivers are available")
+                print(f"\n[WARNING] Configured driver '{driver_name}' not found, but other SQL Server drivers are available")
                 sql_drivers = [d for d in drivers if 'SQL Server' in d]
                 print(f"   Recommended drivers: {', '.join(sql_drivers)}")
                 
                 with open(OUTPUT_FILE, "a") as f:
-                    f.write(f"\n⚠️ Configured driver '{driver_name}' not found, but other SQL Server drivers are available\n")
+                    f.write(f"\n[WARNING] Configured driver '{driver_name}' not found, but other SQL Server drivers are available\n")
                     f.write(f"   Recommended drivers: {', '.join(sql_drivers)}\n")
                     f.flush()
             else:
-                print(f"\n❌ ERROR: No SQL Server ODBC drivers found on this system")
+                print(f"\n[ERROR] No SQL Server ODBC drivers found on this system")
                 print(f"   Install the Microsoft ODBC Driver for SQL Server")
                 
                 with open(OUTPUT_FILE, "a") as f:
-                    f.write(f"\n❌ ERROR: No SQL Server ODBC drivers found on this system\n")
+                    f.write(f"\n[ERROR] No SQL Server ODBC drivers found on this system\n")
                     f.write(f"   Install the Microsoft ODBC Driver for SQL Server\n")
                     f.flush()
         except Exception as e:
-            print(f"\n❌ ERROR checking ODBC drivers: {str(e)}")
+            print(f"\n[ERROR] Error checking ODBC drivers: {str(e)}")
             with open(OUTPUT_FILE, "a") as f:
-                f.write(f"\n❌ ERROR checking ODBC drivers: {str(e)}\n")
+                f.write(f"\n[ERROR] Error checking ODBC drivers: {str(e)}\n")
                 f.flush()
         
         # Run the comprehensive connection test
@@ -1381,20 +1381,20 @@ Schema retrieval encountered errors. Limited table information available:
         # Get schema summary (if available)
         print("\n4. SCHEMA STATUS:")
         if self.schema_summary:
-            print("✅ Schema summary available:")
+            print("[OK] Schema summary available:")
             print(self.schema_summary[:300] + "..." if len(self.schema_summary) > 300 else self.schema_summary)
             
             with open(OUTPUT_FILE, "a") as f:
                 f.write("\n4. SCHEMA STATUS:\n")
-                f.write("✅ Schema summary available:\n")
+                f.write("[OK] Schema summary available:\n")
                 f.write(self.schema_summary[:500] + "..." if len(self.schema_summary) > 500 else self.schema_summary)
                 f.write("\n")
                 f.flush()
         else:
-            print("❌ Schema summary not available")
+            print("[ERROR] Schema summary not available")
             with open(OUTPUT_FILE, "a") as f:
                 f.write("\n4. SCHEMA STATUS:\n")
-                f.write("❌ Schema summary not available\n")
+                f.write("[ERROR] Schema summary not available\n")
                 f.flush()
         
         # Show system status
@@ -1412,26 +1412,26 @@ Schema retrieval encountered errors. Limited table information available:
         # Final diagnostic summary
         print("\n===== DIAGNOSTIC SUMMARY =====")
         if connection_ok:
-            print("✅ SQL CONNECTION: Working properly")
+            print("[OK] SQL CONNECTION: Working properly")
         else:
-            print("❌ SQL CONNECTION: Not working")
+            print("[ERROR] SQL CONNECTION: Not working")
         
         if self.schema_summary:
-            print("✅ SCHEMA: Available")
+            print("[OK] SCHEMA: Available")
         else:
-            print("❌ SCHEMA: Not available")
+            print("[ERROR] SCHEMA: Not available")
         
         with open(OUTPUT_FILE, "a") as f:
             f.write("\n===== DIAGNOSTIC SUMMARY =====\n")
             if connection_ok:
-                f.write("✅ SQL CONNECTION: Working properly\n")
+                f.write("[OK] SQL CONNECTION: Working properly\n")
             else:
-                f.write("❌ SQL CONNECTION: Not working\n")
+                f.write("[ERROR] SQL CONNECTION: Not working\n")
             
             if self.schema_summary:
-                f.write("✅ SCHEMA: Available\n")
+                f.write("[OK] SCHEMA: Available\n")
             else:
-                f.write("❌ SCHEMA: Not available\n")
+                f.write("[ERROR] SCHEMA: Not available\n")
             
             f.write("\nTroubleshooting steps if you have issues:\n")
             f.write("1. Check that all environment variables are correctly set in your .env file\n")
@@ -1610,9 +1610,9 @@ Schema retrieval encountered errors. Limited table information available:
                 f.write("\n================================\n")
             
             # Parse the test output to determine success/failure
-            if "❌" in test_output:
+            if "[FAILED]" in test_output or "[ERROR]" in test_output:
                 # Extract specific error for focused debugging
-                error_lines = [line for line in test_output.split('\n') if "❌" in line]
+                error_lines = [line for line in test_output.split('\n') if "[FAILED]" in line or "[ERROR]" in line]
                 
                 logger.error(f"Connection test failed with {len(error_lines)} errors")
                 for err in error_lines:
@@ -1630,28 +1630,28 @@ Schema retrieval encountered errors. Limited table information available:
                     primary_issue = "Cannot access table - user may lack SELECT permission"
                 
                 # Display a focused error message
-                print(f"\nCONNECTION ERROR: {primary_issue}")
+                print(f"\n[ERROR] CONNECTION ERROR: {primary_issue}")
                 with open(OUTPUT_FILE, "a") as f:
-                    f.write(f"\nCONNECTION ERROR: {primary_issue}\n")
+                    f.write(f"\n[ERROR] CONNECTION ERROR: {primary_issue}\n")
                     f.write("Please fix this issue before proceeding.\n")
                     f.write("You can run the /diagnose command for more details.\n")
                 
                 return False
             else:
-                print("\nConnection test PASSED!")
+                print("\n[SUCCESS] Connection test PASSED!")
                 with open(OUTPUT_FILE, "a") as f:
-                    f.write("\nConnection test successful!\n")
+                    f.write("\n[SUCCESS] Connection test successful!\n")
                     f.flush()
                 return True
             
         except Exception as e:
             logger.error(f"Error running connection test: {e}", exc_info=True)
-            print(f"\nError running connection test: {e}")
+            print(f"\n[ERROR] Error running connection test: {e}")
             with open(OUTPUT_FILE, "a") as f:
-                f.write(f"\nError running connection test: {e}\n")
+                f.write(f"\n[ERROR] Error running connection test: {e}\n")
                 f.flush()
             return False
-            
+
     async def direct_sql_test(self) -> bool:
         """
         Directly test SQL connectivity using pyodbc without relying on server process.
@@ -1707,19 +1707,19 @@ Schema retrieval encountered errors. Limited table information available:
                 
                 if success:
                     version_summary = result[:100] + "..." if len(result) > 100 else result
-                    print(f"✅ Direct connection successful")
+                    print(f"[SUCCESS] Direct connection successful")
                     print(f"SQL Server version: {version_summary}")
                     
                     with open(OUTPUT_FILE, "a") as f:
-                        f.write("✅ Direct connection successful\n")
+                        f.write("[SUCCESS] Direct connection successful\n")
                         f.write(f"SQL Server version: {version_summary}\n")
                         f.flush()
                     return True
                 else:
-                    print(f"❌ Direct connection failed: {result}")
+                    print(f"[FAILED] Direct connection failed: {result}")
                     
                     with open(OUTPUT_FILE, "a") as f:
-                        f.write(f"❌ Direct connection failed: {result}\n")
+                        f.write(f"[FAILED] Direct connection failed: {result}\n")
                         f.write("This indicates a fundamental connection issue with SQL Server.\n")
                         f.write("Possible causes:\n")
                         f.write("1. SQL Server is not running or unreachable\n") 
@@ -1729,20 +1729,20 @@ Schema retrieval encountered errors. Limited table information available:
                         f.flush()
                     return False
             except asyncio.TimeoutError:
-                print(f"❌ Connection attempt timed out after 15 seconds")
+                print(f"[TIMEOUT] Connection attempt timed out after 15 seconds")
                 
                 with open(OUTPUT_FILE, "a") as f:
-                    f.write(f"❌ Connection attempt timed out after 15 seconds\n")
+                    f.write(f"[TIMEOUT] Connection attempt timed out after 15 seconds\n")
                     f.write("This typically indicates network connectivity issues\n")
                     f.write("or that the SQL Server is unreachable.\n")
                     f.flush()
                 return False
                 
         except Exception as e:
-            print(f"❌ Error during direct connection test: {str(e)}")
+            print(f"[ERROR] Error during direct connection test: {str(e)}")
             
             with open(OUTPUT_FILE, "a") as f:
-                f.write(f"❌ Error during direct connection test: {str(e)}\n")
+                f.write(f"[ERROR] Error during direct connection test: {str(e)}\n")
                 f.flush()
             return False
 
