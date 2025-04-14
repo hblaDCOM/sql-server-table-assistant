@@ -138,6 +138,9 @@ class FileBasedClientSession:
     async def initialize(self):
         """Initialize the session."""
         print("File-based session initialized.")
+        # Write to output file
+        with open(OUTPUT_FILE, "a") as f:
+            f.write("File-based session initialized.\n")
         
     async def call_tool(self, tool_name, args):
         """Call a tool by writing to output file and waiting for response."""
@@ -156,8 +159,17 @@ class FileBasedClientSession:
                 f.write(f"{args['sql']}\n")
                 f.write("---------------------------\n")
                 f.write("WAITING_FOR_RESULT\n")
+        elif tool_name == "test_connection":
+            print(f"Testing SQL Server connection")
+            
+            # Write tool call to output
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\n--- Testing SQL Server Connection ---\n")
+                f.write("Attempting to connect to SQL Server to verify connectivity...\n")
+                f.write("WAITING_FOR_RESULT\n")
         else:
             # Write generic tool call to output
+            print(f"Calling tool: {tool_name}")
             with open(OUTPUT_FILE, "a") as f:
                 f.write(f"\nTOOL_CALL: {tool_name}\n")
                 f.write(f"ARGS: {json.dumps(args)}\n")
@@ -173,11 +185,30 @@ class FileBasedClientSession:
         
         # Track file modification time
         last_modified = os.path.getmtime(INPUT_FILE) if os.path.exists(INPUT_FILE) else 0
-        timeout_seconds = 120  # 2 minute timeout
+        timeout_seconds = 60  # 1 minute timeout
         start_time = time.time()
+        last_progress_time = time.time()
+        
+        # For timeout tracking
+        last_progress_msg = ""
         
         while True:
             try:
+                # Print a progress message every 5 seconds to show we're still alive
+                current_time = time.time()
+                if current_time - last_progress_time > 5:
+                    elapsed = int(current_time - start_time)
+                    progress_msg = f"Still waiting for {tool_name} after {elapsed} seconds..."
+                    print(progress_msg)
+                    
+                    # Only write progress to file if different from last message
+                    if progress_msg != last_progress_msg:
+                        with open(OUTPUT_FILE, "a") as f:
+                            f.write(f"\n{progress_msg}\n")
+                        last_progress_msg = progress_msg
+                        
+                    last_progress_time = current_time
+                
                 # Check if file exists and has been modified
                 if os.path.exists(INPUT_FILE):
                     current_mod_time = os.path.getmtime(INPUT_FILE)
@@ -192,6 +223,7 @@ class FileBasedClientSession:
                             
                         # Only clear the file if we got some content
                         if result:
+                            print(f"Received result for {tool_name} tool call after {int(time.time() - start_time)} seconds")
                             with open(INPUT_FILE, "w") as f:
                                 pass
                             
@@ -204,20 +236,41 @@ class FileBasedClientSession:
                 
                 # Check for timeout
                 if time.time() - start_time > timeout_seconds:
-                    print("Timeout waiting for tool result")
+                    error_msg = f"Timeout waiting for tool result after {timeout_seconds} seconds"
+                    print(error_msg)
+                    
                     # Clear the flag file
                     if os.path.exists(flag_file):
                         os.remove(flag_file)
-                    return MockResponse(f"Error: Timeout waiting for {tool_name} result")
+                    
+                    # Special handling for different tools
+                    if tool_name == "test_connection":
+                        return MockResponse("Connection failed: Timeout while waiting for SQL Server response. This typically indicates network connectivity issues or that the SQL Server is unreachable.")
+                    elif tool_name == "get_table_schema":
+                        return MockResponse("Error retrieving schema: Connection timed out after 60 seconds. Please check SQL Server connectivity and that the table exists.")
+                    elif tool_name == "query_table":
+                        return MockResponse(f"Error: SQL query execution timed out after 60 seconds. The query may be too complex or the server may be unresponsive.\nQuery: {args.get('sql', 'Unknown')}")
+                    else:
+                        return MockResponse(f"Error: Timeout waiting for {tool_name} result")
                 
                 # Sleep briefly to avoid CPU spinning
                 await asyncio.sleep(0.5)
             except Exception as e:
                 print(f"Error waiting for tool result: {e}")
+                
                 # Clear the flag file
                 if os.path.exists(flag_file):
                     os.remove(flag_file)
-                return MockResponse(f"Error: {str(e)}")
+                
+                # Special handling for different tools
+                if tool_name == "test_connection":
+                    return MockResponse(f"Connection failed: An error occurred: {str(e)}")
+                elif tool_name == "get_table_schema":
+                    return MockResponse(f"Error retrieving schema: {str(e)}")
+                elif tool_name == "query_table":
+                    return MockResponse(f"Error: SQL query execution failed: {str(e)}\nQuery: {args.get('sql', 'Unknown')}")
+                else:
+                    return MockResponse(f"Error: {str(e)}")
 
 @dataclass
 class QueryIteration:
@@ -341,8 +394,18 @@ class Chat:
         schema_error = False
         basic_info = ""
         
+        # Write initial status to output file
+        with open(OUTPUT_FILE, "a") as f:
+            f.write(f"\n===== FETCHING SCHEMA FOR {FULLY_QUALIFIED_TABLE_NAME} =====\n")
+            f.write(f"SQL Server: {os.getenv('MSSQL_SERVER', 'Not set')}\n")
+            f.write(f"Database: {os.getenv('MSSQL_DATABASE', 'Not set')}\n")
+            f.write(f"Authentication: {os.getenv('MSSQL_USERNAME', 'Windows Authentication')}\n")
+            f.write("Connecting to database...\n")
+        
         try:
+            print("Calling get_table_schema tool...")
             result = await session.call_tool("get_table_schema", {})
+            print("get_table_schema tool returned")
             self.table_schema = getattr(result.content[0], "text", "")
             
             # Check if schema contains error messages
@@ -352,11 +415,22 @@ class Chat:
                 print(self.table_schema)
                 print("===================================\n")
                 
+                # Write error to output file
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write("\n===== TABLE SCHEMA ERROR =====\n")
+                    f.write("Failed to retrieve complete table schema:\n")
+                    f.write(self.table_schema)
+                    f.write("\n===================================\n")
+                
                 # Save the error trace
                 schema_error = True
                 print("Attempting to retrieve basic table information instead...")
             else:
                 print("Schema information fetched successfully.")
+                # Write success to output file
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write("Schema retrieved successfully!\n")
+                
                 # Create a concise schema summary to reduce token usage
                 self.schema_summary = await self.create_schema_summary(self.table_schema)
                 print("Created concise schema summary.")
@@ -366,6 +440,14 @@ class Chat:
             print(error_message)
             print("Full exception details:", repr(e))
             print("===================================\n")
+            
+            # Write error to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n===== TABLE SCHEMA ERROR =====\n")
+                f.write(f"Error fetching schema: {str(e)}\n")
+                f.write(f"Full exception details: {repr(e)}\n")
+                f.write("===================================\n")
+            
             schema_error = True
             self.table_schema = f"Schema information not available due to error: {str(e)}"
             
@@ -373,10 +455,21 @@ class Chat:
         if schema_error:
             try:
                 print("Attempting to fetch basic table information as fallback...")
+                
+                # Write to output file
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write("\nAttempting to fetch basic table information as fallback...\n")
+                
                 basic_result = await session.call_tool("get_table_info", {})
                 basic_info = getattr(basic_result.content[0], "text", "")
                 print("Basic table information retrieved:")
                 print(basic_info)
+                
+                # Write to output file
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write("Basic table information retrieved:\n")
+                    f.write(basic_info)
+                    f.write("\n")
                 
                 # Use basic info as the schema summary
                 self.schema_summary = basic_info
@@ -391,6 +484,12 @@ Schema retrieval encountered errors. Limited table information available:
 """
             except Exception as basic_error:
                 print(f"Error retrieving basic table info: {basic_error}")
+                
+                # Write to output file
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"\nError retrieving basic table info: {basic_error}\n")
+                    f.write("Both schema and basic info retrieval failed.\n")
+                
                 self.table_schema = "Both full schema and basic table information retrieval failed."
                 self.schema_summary = f"Table: {FULLY_QUALIFIED_TABLE_NAME}"
             
@@ -403,6 +502,11 @@ Schema retrieval encountered errors. Limited table information available:
             print("System prompt updated with schema summary.")
         except Exception as format_error:
             print(f"Error formatting system prompt: {format_error}")
+            
+            # Write to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\nError formatting system prompt: {format_error}\n")
+            
             # Fallback to direct replacement if formatting fails
             self.system_prompt = self.system_prompt.replace("{schema_summary}", self.schema_summary)
             self.system_prompt = self.system_prompt.replace("{table_name}", FULLY_QUALIFIED_TABLE_NAME)
@@ -930,22 +1034,110 @@ Schema retrieval encountered errors. Limited table information available:
     async def run(self):
         """Main entry point to run the chat session."""
         try:
-            # Use the FileBasedClientSession directly instead of stdio_client
-            session = FileBasedClientSession()
-            await session.initialize()
+            # Print startup information
+            print(f"\n===== SQL TABLE ASSISTANT STARTUP =====")
+            print(f"Starting file-based client with:")
+            print(f"Input file: {INPUT_FILE}")
+            print(f"Output file: {OUTPUT_FILE}")
+            print(f"Table: {FULLY_QUALIFIED_TABLE_NAME}")
+            print(f"SQL Server environment variables:")
+            print(f"  MSSQL_SERVER: {os.getenv('MSSQL_SERVER', 'Not set')}")
+            print(f"  MSSQL_DATABASE: {os.getenv('MSSQL_DATABASE', 'Not set')}")
+            print(f"  MSSQL_USERNAME: {os.getenv('MSSQL_USERNAME', 'Not set (using Windows Auth)')}")
+            print(f"  MSSQL_PASSWORD: {'[PROVIDED]' if os.getenv('MSSQL_PASSWORD') else 'Not set'}")
+            print(f"  MSSQL_DRIVER: {os.getenv('MSSQL_DRIVER', 'Not set')}")
+            print(f"===================================\n")
             
-            # Fetch schema information before starting chat loop
-            await self.fetch_schema(session)
+            # Write startup info to output file
+            with open(OUTPUT_FILE, "w") as f:
+                f.write(f"\n===== SQL TABLE ASSISTANT STARTUP =====\n")
+                f.write(f"Starting assistant for table: {FULLY_QUALIFIED_TABLE_NAME}\n")
+                f.write(f"Connected to server: {os.getenv('MSSQL_SERVER', 'Not set')}\n")
+                f.write(f"Database: {os.getenv('MSSQL_DATABASE', 'Not set')}\n")
+                f.write("Initializing connection...\n")
+            
+            # Use the FileBasedClientSession directly
+            print("Creating file-based client session...")
+            session = FileBasedClientSession()
+            print("Initializing session...")
+            
+            # Initialize with timeout
+            init_task = asyncio.create_task(session.initialize())
+            try:
+                await asyncio.wait_for(init_task, timeout=10)
+                print("Session initialized successfully.")
+            except asyncio.TimeoutError:
+                print("Session initialization timed out after 10 seconds")
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write("\nSESSION INITIALIZATION TIMEOUT\n")
+                    f.write("The SQL connection initialization process timed out after 10 seconds.\n")
+                    f.write("This usually indicates a network connectivity issue to the SQL Server.\n")
+                    f.write("Please check your SQL Server connection settings and network connectivity.\n")
+            
+            # Fetch schema information with timeout
+            print("Fetching schema information...")
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\nFetching table schema...\n")
+                
+            schema_task = asyncio.create_task(self.fetch_schema(session))
+            try:
+                await asyncio.wait_for(schema_task, timeout=30)
+                print("Schema fetched successfully.")
+            except asyncio.TimeoutError:
+                print("Schema fetch timed out after 30 seconds")
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write("\nSCHEMA FETCH TIMEOUT\n")
+                    f.write("The schema retrieval process timed out after 30 seconds.\n")
+                    f.write("This usually indicates a problem with the SQL Server connection or permissions.\n")
+                    f.write("Continuing with limited functionality...\n")
+                    
+                # Set default schema if timeout occurred
+                if not self.schema_summary:
+                    self.schema_summary = f"Table: {FULLY_QUALIFIED_TABLE_NAME}\nSchema could not be retrieved due to timeout."
+                    self.system_prompt = self.system_prompt.replace("{schema_summary}", self.schema_summary)
+                    self.system_prompt = self.system_prompt.replace("{table_name}", FULLY_QUALIFIED_TABLE_NAME)
             
             # Fetch and display a data preview to verify database connection
-            await self.fetch_data_preview(session)
+            print("Fetching data preview...")
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\nAttempting to fetch data preview...\n")
+                
+            preview_task = asyncio.create_task(self.fetch_data_preview(session))
+            try:
+                await asyncio.wait_for(preview_task, timeout=30)
+                print("Data preview fetched successfully.")
+            except asyncio.TimeoutError:
+                print("Data preview fetch timed out after 30 seconds")
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write("\nDATA PREVIEW TIMEOUT\n")
+                    f.write("The data preview retrieval process timed out after 30 seconds.\n")
+                    f.write("Unable to verify database connection.\n")
+                    f.write("=== CONNECTION TROUBLESHOOTING ===\n")
+                    f.write(f"1. Verify SQL Server '{os.getenv('MSSQL_SERVER', 'Not set')}' is reachable\n")
+                    f.write(f"2. Verify database '{os.getenv('MSSQL_DATABASE', 'Not set')}' exists and is online\n")
+                    f.write(f"3. Check credentials and permissions for '{os.getenv('MSSQL_USERNAME', 'current user')}'\n")
+                    f.write(f"4. Verify table '{FULLY_QUALIFIED_TABLE_NAME}' exists in the database\n")
+                    f.write("=================================\n")
             
             # Start the interactive chat loop
+            print("Starting chat loop...")
             await self.chat_loop(session)
         except Exception as e:
             print(f"Error running chat: {e}")
             import traceback
             traceback.print_exc()
+            
+            # Write error to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\n===== FATAL ERROR =====\n")
+                f.write(f"The SQL Table Assistant encountered a fatal error:\n{str(e)}\n\n")
+                f.write("This might be due to SQL Server connection issues or configuration problems.\n")
+                f.write("Please check the following:\n")
+                f.write("1. SQL Server connection settings in your .env file\n")
+                f.write("2. Network connectivity to the SQL Server\n")
+                f.write("3. Proper installation of SQL Server drivers\n")
+                f.write("4. Table name and permissions\n")
+                f.write("===========================\n")
 
     async def fetch_data_preview(self, session: ClientSession) -> None:
         """Fetch a preview of the data (first row) to verify SQL connection."""
@@ -955,35 +1147,56 @@ Schema retrieval encountered errors. Limited table information available:
             with open(OUTPUT_FILE, "a") as f:
                 f.write("\n===== CHECKING DATABASE CONNECTION =====\n")
                 f.write(f"Connecting to table: {FULLY_QUALIFIED_TABLE_NAME}\n")
-                f.write(f"Connection parameters: Server={os.getenv('MSSQL_SERVER', 'Not set')}, Database={os.getenv('MSSQL_DATABASE', 'Not set')}\n")
+                f.write(f"Connection parameters:\n")
+                f.write(f"Server: {os.getenv('MSSQL_SERVER', 'Not set')}\n")
+                f.write(f"Database: {os.getenv('MSSQL_DATABASE', 'Not set')}\n")
+                f.write(f"Username: {os.getenv('MSSQL_USERNAME', 'Not set (using Windows Auth)')}\n")
+                f.write(f"ODBC Driver: {os.getenv('MSSQL_DRIVER', 'Not set')}\n")
                 f.write("Fetching sample data...\n")
             
             # Try a connection test query first
+            print("Attempting direct connection test...")
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("Attempting direct connection test...\n")
+                
             try:
+                print("Calling test_connection tool...")
                 test_result = await session.call_tool("test_connection", {})
+                print("test_connection tool returned")
                 test_status = getattr(test_result.content[0], "text", "")
                 
                 with open(OUTPUT_FILE, "a") as f:
                     f.write(f"\n--- Connection Test Result ---\n{test_status}\n\n")
                 
                 if "Connection failed" in test_status:
+                    print(f"SQL Server connection test failed: {test_status}")
                     raise Exception(f"SQL Server connection test failed: {test_status}")
                 
                 print(f"Connection test result: {test_status}")
             except Exception as conn_err:
                 print(f"Connection test error: {conn_err}")
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"Connection test error: {conn_err}\n")
                 # Continue anyway to get more specific error
 
             # Simple query to get top 5 rows with all fields
             preview_sql = f"SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}"
             print(f"Executing preview query: {preview_sql}")
             
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"Executing query: {preview_sql}\n")
+            
             # Execute query
+            print("Calling query_table tool...")
             result = await session.call_tool("query_table", {"sql": preview_sql})
+            print("query_table tool returned")
             preview_data = getattr(result.content[0], "text", "")
             
             # Check if the result contains error message
             if preview_data.startswith("Error:") or "Error retrieving data" in preview_data:
+                print(f"Error in preview data: {preview_data}")
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"Error in preview query: {preview_data}\n")
                 raise Exception(preview_data)
             
             # Write to output file
@@ -1007,10 +1220,13 @@ Schema retrieval encountered errors. Limited table information available:
             # Get diagnostic information
             try:
                 # Try to run diagnostics to get more info
+                print("Calling diagnose_table_access tool...")
                 diag_result = await session.call_tool("diagnose_table_access", {})
+                print("diagnose_table_access tool returned")
                 diagnostics = getattr(diag_result.content[0], "text", "")
-            except:
-                diagnostics = "Could not retrieve diagnostics information"
+            except Exception as diag_error:
+                diagnostics = f"Could not retrieve diagnostics information: {str(diag_error)}"
+                print(f"Diagnostics error: {diag_error}")
             
             # Write detailed error to output file
             with open(OUTPUT_FILE, "a") as f:
@@ -1021,6 +1237,8 @@ Schema retrieval encountered errors. Limited table information available:
                 f.write(f"Table: {FULLY_QUALIFIED_TABLE_NAME}\n")
                 f.write(f"Server: {os.getenv('MSSQL_SERVER', 'Not configured')}\n")
                 f.write(f"Database: {os.getenv('MSSQL_DATABASE', 'Not configured')}\n")
+                f.write(f"Username: {os.getenv('MSSQL_USERNAME', 'Not configured (using Windows Auth)')}\n")
+                f.write(f"Password: {'[PROVIDED]' if os.getenv('MSSQL_PASSWORD') else 'Not configured'}\n")
                 f.write(f"Driver: {os.getenv('MSSQL_DRIVER', 'Not configured')}\n")
                 f.write(f"Authentication: Using {'SQL Server Authentication' if os.getenv('MSSQL_USERNAME') else 'Windows Authentication'}\n\n")
                 f.write("===== DIAGNOSTICS =====\n")
