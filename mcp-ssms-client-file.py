@@ -732,8 +732,9 @@ Schema retrieval encountered errors. Limited table information available:
     async def run(self):
         """Main entry point to run the chat session."""
         try:
-            # Initialize with MCP server - provide the required server parameter
-            async with stdio_client("mcp-server") as (read, write):
+            # Initialize with file-based client for web server integration
+            # Use the server_params object properly
+            async with stdio_client(server_params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     
