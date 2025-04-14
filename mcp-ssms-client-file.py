@@ -10,6 +10,49 @@ import asyncio
 import sys
 from openai import AzureOpenAI
 import time
+import signal
+import pyodbc
+import logging
+import argparse
+from math import isnan, isinf
+from tabulate import tabulate
+import threading
+
+# Constants for file-based operation
+INPUT_FILE = os.environ.get("MCP_INPUT_FILE", "./mcp_input.txt")
+OUTPUT_FILE = os.environ.get("MCP_OUTPUT_FILE", "./mcp_output.txt")
+FLAG_FILE = os.environ.get("MCP_FLAG_FILE", "./mcp_input.txt.waiting")
+LOG_FILE = os.environ.get("MCP_LOG_FILE", "./mcp_client.log")
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger('mcp-ssms-client-file')
+
+# Global variables
+running = True
+
+# Signal handler for graceful shutdown
+def signal_handler(sig, frame):
+    global running
+    print(f"Received signal {sig}, shutting down gracefully...")
+    with open(OUTPUT_FILE, "a") as f:
+        f.write("\nService is shutting down. Please restart if needed.\n")
+        f.flush()
+    running = False
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+if hasattr(signal, 'SIGBREAK'):  # Windows
+    signal.signal(signal.SIGBREAK, signal_handler)
 
 # Initialize OpenAI client
 client = AzureOpenAI(
@@ -49,124 +92,80 @@ print(f"Using input file: {INPUT_FILE}")
 print(f"Using output file: {OUTPUT_FILE}")
 
 # Function to read input from file - for file-based operation
-def get_input(prompt):
-    """Get user input from file instead of stdin."""
-    # Print the prompt to output file WITHOUT waiting tag
-    with open(OUTPUT_FILE, "a") as f:
-        f.write(f"{prompt}\n")
-        # Force flush to ensure content is written immediately
-        f.flush()
-    
-    print(f"Waiting for user input: {prompt}")
-    
-    # Flag file approach - write a flag file that the web server will check
-    flag_file = f"{INPUT_FILE}.waiting"
-    try:
-        with open(flag_file, "w") as f:
-            f.write("waiting for input")
+def get_input(prompt=None):
+    """
+    Wait for input from a file instead of standard input.
+    """
+    if prompt:
+        with open(OUTPUT_FILE, "a") as f:
+            f.write(f"\n{prompt}\n")
             f.flush()
+    
+    global running
+    # Create a flag file to indicate we're waiting for input
+    try:
+        with open(FLAG_FILE, "w") as f:
+            f.write("1")
     except Exception as e:
-        print(f"Error creating flag file: {e}")
+        logger.error(f"Error creating flag file: {e}")
     
-    # Wait for input in the input file
-    last_modified = os.path.getmtime(INPUT_FILE) if os.path.exists(INPUT_FILE) else 0
-    timeout_seconds = 300  # 5 minute timeout
-    start_time = time.time()
-    last_check_time = time.time()
+    # Clear the input file before waiting
+    try:
+        open(INPUT_FILE, "w").close()
+    except Exception as e:
+        logger.error(f"Error clearing input file: {e}")
     
-    # Single attempt to read existing content
-    if os.path.exists(INPUT_FILE):
+    # Wait for input to appear in the file (max 30 minutes)
+    max_attempts = 1800  # 30 minutes with 1 second sleep
+    for attempt in range(max_attempts):
+        if not running:
+            return "exit"  # Exit gracefully if shutdown signal received
+            
         try:
             with open(INPUT_FILE, "r") as f:
                 content = f.read().strip()
             
-            if content and content != "__HEARTBEAT__":
-                print(f"Found existing input: {content[:30]}..." if len(content) > 30 else f"Found existing input: {content}")
-                
-                # Clear the file after reading
-                with open(INPUT_FILE, "w") as f:
-                    f.write("")
-                    f.flush()
+            if content:
+                # Check if this is a probe message
+                if content.startswith("__PROBE__"):
+                    logger.info(f"Received probe: {content}")
+                    # Acknowledge the probe
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write(f"\n__PROBE_ACK__: {content[9:]}\n")
+                        f.flush()
+                    
+                    # Clear the input and flag files
+                    try:
+                        open(INPUT_FILE, "w").close()
+                        if os.path.exists(FLAG_FILE):
+                            os.remove(FLAG_FILE)
+                    except Exception as e:
+                        logger.error(f"Error clearing files after probe: {e}")
+                    
+                    # Continue waiting for real input
+                    continue
                 
                 # Clear the flag file
-                if os.path.exists(flag_file):
-                    try:
-                        os.remove(flag_file)
-                    except:
-                        pass
-                    
-                print(f"Input received immediately: {content[:30]}..." if len(content) > 30 else f"Input received immediately: {content}")
+                try:
+                    if os.path.exists(FLAG_FILE):
+                        os.remove(FLAG_FILE)
+                except Exception as e:
+                    logger.error(f"Error removing flag file: {e}")
+                
                 return content
         except Exception as e:
-            print(f"Error reading initial input: {e}")
+            logger.error(f"Error reading input file: {e}")
+        
+        time.sleep(1)
     
-    # Now wait for new content
-    while True:
-        try:
-            # Only check at reasonable intervals to reduce file operations
-            current_time = time.time()
-            if current_time - last_check_time < 0.5:
-                time.sleep(0.1)
-                continue
-                
-            last_check_time = current_time
-            
-            # Check if file exists
-            if not os.path.exists(INPUT_FILE):
-                continue
-                
-            # Check file content
-            with open(INPUT_FILE, "r") as f:
-                content = f.read().strip()
-            
-            # Check if content is valid
-            if not content:
-                continue
-                
-            # Skip heartbeat messages
-            if content == "__HEARTBEAT__":
-                with open(INPUT_FILE, "w") as f:
-                    f.write("")
-                    f.flush()
-                continue
-            
-            # Valid content received
-            with open(INPUT_FILE, "w") as f:
-                f.write("")
-                f.flush()
-            
-            # Clear the flag file
-            if os.path.exists(flag_file):
-                try:
-                    os.remove(flag_file)
-                except:
-                    pass
-                
-            print(f"Input received: {content[:30]}..." if len(content) > 30 else f"Input received: {content}")
-            
-            # Confirm processing to output file
-            with open(OUTPUT_FILE, "a") as f:
-                f.write(f"\nReceived input: {content[:30]}...\n" if len(content) > 30 else f"\nReceived input: {content}\n")
-                f.write("Processing your query...\n")
-                f.flush()
-                
-            return content
-            
-            # Check for timeout
-            if time.time() - start_time > timeout_seconds:
-                print("Timeout waiting for user input")
-                # Clear the flag file
-                if os.path.exists(flag_file):
-                    try:
-                        os.remove(flag_file)
-                    except:
-                        pass
-                return "/exit"  # Exit if timeout
-            
-        except Exception as e:
-            print(f"Error reading input: {e}")
-            # Brief pause to prevent tight loop on persistent errors
-            time.sleep(0.5)
+    # If we reach here, we timed out
+    try:
+        if os.path.exists(FLAG_FILE):
+            os.remove(FLAG_FILE)
+    except Exception as e:
+        logger.error(f"Error removing flag file after timeout: {e}")
+    
+    return "Timed out waiting for input"
 
 # Simple mock ClientSession for file-based operation
 class FileBasedClientSession:
@@ -681,6 +680,15 @@ Schema retrieval encountered errors. Limited table information available:
         """Process a natural language query, generate SQL, and execute it with user approval."""
         print(f"\nProcessing query: {query}")
         
+        # Check for special commands and inputs
+        if query.startswith("__") and query.endswith("__"):
+            print(f"Received special command: {query}")
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\nReceived special command: {query}\n")
+                f.write("This is a system command and will not be processed as a query.\n")
+                f.flush()
+            return
+        
         # Write processing acknowledgement to output
         with open(OUTPUT_FILE, "a") as f:
             f.write(f"\nProcessing your query: {query}\n")
@@ -737,6 +745,11 @@ Schema retrieval encountered errors. Limited table information available:
             print("\nDo you want to (e)xecute this query, provide (f)eedback to refine it, or (c)ancel? (e/f/c): ")
             decision = get_input("").strip().lower()
             
+            # Handle special decision inputs like __PROBE__
+            if decision.startswith("__") and decision.endswith("__"):
+                print(f"Received special command as decision: {decision}")
+                continue
+            
             if decision == 'c':
                 print("Query canceled.")
                 with open(OUTPUT_FILE, "a") as f:
@@ -750,6 +763,15 @@ Schema retrieval encountered errors. Limited table information available:
                     f.flush()
                     
                 feedback = get_input("Enter your feedback for improving the SQL query: ")
+                
+                # Handle special inputs in feedback
+                if feedback.startswith("__") and feedback.endswith("__"):
+                    print(f"Received special command as feedback: {feedback}")
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write("\nQuery refinement canceled due to special command.\n")
+                        f.flush()
+                    break
+                
                 current_iteration.feedback = feedback
                 
                 with open(OUTPUT_FILE, "a") as f:

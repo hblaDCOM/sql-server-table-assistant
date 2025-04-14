@@ -1,0 +1,5 @@
+python-dotenv
+mcp
+pyodbc
+loguru
+openai>=1.0.0
