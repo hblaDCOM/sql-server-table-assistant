@@ -1,39 +1,43 @@
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
-from datetime import datetime
 import os
-import re
-import json
-import math
-from mcp import ClientSession
-import asyncio
 import sys
+import json
+import openai
+import re
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime
+from tabulate import tabulate
+import threading
+from dotenv import load_dotenv
+import math
+from typing import Dict, List, Optional, Any, Tuple
+from mcp import ClientSession
 from openai import AzureOpenAI
 import time
 import signal
 import pyodbc
-import logging
-import argparse
 from math import isnan, isinf
-from tabulate import tabulate
-import threading
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("client_debug.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("mcp-ssms-client")
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Constants for file-based operation
 INPUT_FILE = os.environ.get("MCP_INPUT_FILE", "./mcp_input.txt")
 OUTPUT_FILE = os.environ.get("MCP_OUTPUT_FILE", "./mcp_output.txt")
 FLAG_FILE = os.environ.get("MCP_FLAG_FILE", "./mcp_input.txt.waiting")
 LOG_FILE = os.environ.get("MCP_LOG_FILE", "./mcp_client.log")
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger('mcp-ssms-client-file')
 
 # Global variables
 running = True
@@ -90,6 +94,66 @@ else:
 
 print(f"Using input file: {INPUT_FILE}")
 print(f"Using output file: {OUTPUT_FILE}")
+
+# More robust environment variable loading
+def get_env_var(name, default=None, required=False):
+    """Get environment variable with validation"""
+    value = os.getenv(name, default)
+    if required and (value is None or value.strip() == ''):
+        logger.error(f"Required environment variable {name} is not set")
+        print(f"ERROR: Required environment variable {name} is not set or empty")
+        # Write to output file if it exists and is writable
+        try:
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\nCRITICAL ERROR: Required environment variable {name} is not set\n")
+                f.write("This environment variable is required for SQL Server connection.\n")
+                f.write("Please set it in your .env file or environment and restart the application.\n")
+        except:
+            pass
+    return value
+
+# Later in your code where you load environment variables:
+MSSQL_SERVER = get_env_var("MSSQL_SERVER", "localhost", required=True)
+MSSQL_DATABASE = get_env_var("MSSQL_DATABASE", required=True)
+MSSQL_USERNAME = get_env_var("MSSQL_USERNAME", required=True)
+MSSQL_PASSWORD = get_env_var("MSSQL_PASSWORD", required=True)
+MSSQL_DRIVER = get_env_var("MSSQL_DRIVER", "{ODBC Driver 18 for SQL Server}")
+MSSQL_TABLE_SCHEMA = get_env_var("MSSQL_TABLE_SCHEMA", "dbo")
+MSSQL_TABLE_NAME = get_env_var("MSSQL_TABLE_NAME", required=True)
+FULLY_QUALIFIED_TABLE_NAME = f"{MSSQL_TABLE_SCHEMA}.{MSSQL_TABLE_NAME}" if MSSQL_TABLE_SCHEMA else MSSQL_TABLE_NAME
+
+# Validate SQL connection parameters
+def validate_sql_connection_params():
+    """Validate that all required connection parameters are present"""
+    missing_params = []
+    
+    if not MSSQL_SERVER or MSSQL_SERVER.strip() == '':
+        missing_params.append("MSSQL_SERVER")
+    if not MSSQL_DATABASE or MSSQL_DATABASE.strip() == '':
+        missing_params.append("MSSQL_DATABASE")
+    if not MSSQL_USERNAME or MSSQL_USERNAME.strip() == '':
+        missing_params.append("MSSQL_USERNAME")
+    if not MSSQL_PASSWORD:
+        missing_params.append("MSSQL_PASSWORD")
+    if not MSSQL_DRIVER or MSSQL_DRIVER.strip() == '':
+        missing_params.append("MSSQL_DRIVER")
+    
+    if missing_params:
+        error_msg = f"Missing required SQL connection parameters: {', '.join(missing_params)}"
+        logger.error(error_msg)
+        print(f"ERROR: {error_msg}")
+        
+        # Write to output file
+        try:
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\nCRITICAL ERROR: {error_msg}\n")
+                f.write("These parameters are required for SQL Server connection.\n")
+                f.write("Please check your .env file and ensure all required variables are set.\n")
+        except:
+            pass
+        
+        return False
+    return True
 
 # Function to read input from file - for file-based operation
 def get_input(prompt=None):
@@ -1195,30 +1259,180 @@ Schema retrieval encountered errors. Limited table information available:
         print("=======================\n")
 
     async def run_diagnostics(self, session: ClientSession):
-        """Run diagnostics to troubleshoot table access issues."""
+        """Run comprehensive diagnostics to troubleshoot table access issues."""
         print(f"\n===== RUNNING DIAGNOSTICS FOR TABLE {FULLY_QUALIFIED_TABLE_NAME} =====")
+        with open(OUTPUT_FILE, "a") as f:
+            f.write(f"\n===== RUNNING DIAGNOSTICS FOR TABLE {FULLY_QUALIFIED_TABLE_NAME} =====\n")
+            f.flush()
+        
+        # First, show environment variables (with password masked)
+        print("\n1. ENVIRONMENT VARIABLES:")
+        print(f"   MSSQL_SERVER = {MSSQL_SERVER}")
+        print(f"   MSSQL_DATABASE = {MSSQL_DATABASE}")
+        print(f"   MSSQL_USERNAME = {MSSQL_USERNAME}")
+        print(f"   MSSQL_PASSWORD = {'[PROVIDED]' if MSSQL_PASSWORD else '[NOT SET]'}")
+        print(f"   MSSQL_DRIVER = {MSSQL_DRIVER}")
+        print(f"   MSSQL_TABLE_SCHEMA = {MSSQL_TABLE_SCHEMA}")
+        print(f"   MSSQL_TABLE_NAME = {MSSQL_TABLE_NAME}")
+        
+        with open(OUTPUT_FILE, "a") as f:
+            f.write("\n1. ENVIRONMENT VARIABLES:\n")
+            f.write(f"   MSSQL_SERVER = {MSSQL_SERVER}\n")
+            f.write(f"   MSSQL_DATABASE = {MSSQL_DATABASE}\n")
+            f.write(f"   MSSQL_USERNAME = {MSSQL_USERNAME}\n")
+            f.write(f"   MSSQL_PASSWORD = {'[PROVIDED]' if MSSQL_PASSWORD else '[NOT SET]'}\n")
+            f.write(f"   MSSQL_DRIVER = {MSSQL_DRIVER}\n")
+            f.write(f"   MSSQL_TABLE_SCHEMA = {MSSQL_TABLE_SCHEMA}\n")
+            f.write(f"   MSSQL_TABLE_NAME = {MSSQL_TABLE_NAME}\n")
+            f.flush()
+        
+        # Check that required variables are set
+        missing_vars = []
+        if not MSSQL_SERVER:
+            missing_vars.append("MSSQL_SERVER")
+        if not MSSQL_DATABASE:
+            missing_vars.append("MSSQL_DATABASE")
+        if not MSSQL_USERNAME:
+            missing_vars.append("MSSQL_USERNAME")
+        if not MSSQL_PASSWORD:
+            missing_vars.append("MSSQL_PASSWORD")
+        if not MSSQL_DRIVER:
+            missing_vars.append("MSSQL_DRIVER")
+        
+        if missing_vars:
+            print(f"\n❌ ERROR: Missing required environment variables: {', '.join(missing_vars)}")
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\n❌ ERROR: Missing required environment variables: {', '.join(missing_vars)}\n")
+                f.write("These variables must be set in your .env file or environment.\n")
+                f.flush()
+        else:
+            print("\n✅ All required environment variables are set")
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n✅ All required environment variables are set\n")
+                f.flush()
+        
+        # Check for ODBC drivers
         try:
-            # Test table access diagnostics
-            print("Testing table access...")
-            result = await session.call_tool("diagnose_table_access", {})
-            diagnostics = getattr(result.content[0], "text", "")
-            print("\nDiagnostic Results:")
-            print(diagnostics)
+            import pyodbc
+            drivers = pyodbc.drivers()
+            print("\n2. AVAILABLE ODBC DRIVERS:")
+            for driver in drivers:
+                print(f"   - {driver}")
             
-            # Test basic table info
-            print("\nRetrieving basic table information...")
-            basic_result = await session.call_tool("get_table_info", {})
-            basic_info = getattr(basic_result.content[0], "text", "")
-            print("\nBasic Table Information:")
-            print(basic_info)
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n2. AVAILABLE ODBC DRIVERS:\n")
+                for driver in drivers:
+                    f.write(f"   - {driver}\n")
+                f.flush()
             
-            print("\nDiagnostics complete. If you're experiencing issues:")
-            print(f"1. Check if the table {FULLY_QUALIFIED_TABLE_NAME} exists")
-            print("2. Verify that your user has permissions to access this table")
-            print("3. Check the logs directory for detailed error traces")
-            print("4. Use /refresh_schema to attempt to reload the schema")
+            # Check if our driver is available
+            driver_name = MSSQL_DRIVER.strip("{}")
+            if driver_name in drivers:
+                print(f"\n✅ Configured driver '{driver_name}' is available")
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"\n✅ Configured driver '{driver_name}' is available\n")
+                    f.flush()
+            elif any('SQL Server' in driver for driver in drivers):
+                print(f"\n⚠️ Configured driver '{driver_name}' not found, but other SQL Server drivers are available")
+                sql_drivers = [d for d in drivers if 'SQL Server' in d]
+                print(f"   Recommended drivers: {', '.join(sql_drivers)}")
+                
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"\n⚠️ Configured driver '{driver_name}' not found, but other SQL Server drivers are available\n")
+                    f.write(f"   Recommended drivers: {', '.join(sql_drivers)}\n")
+                    f.flush()
+            else:
+                print(f"\n❌ ERROR: No SQL Server ODBC drivers found on this system")
+                print(f"   Install the Microsoft ODBC Driver for SQL Server")
+                
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"\n❌ ERROR: No SQL Server ODBC drivers found on this system\n")
+                    f.write(f"   Install the Microsoft ODBC Driver for SQL Server\n")
+                    f.flush()
         except Exception as e:
-            print(f"Error running diagnostics: {e}")
+            print(f"\n❌ ERROR checking ODBC drivers: {str(e)}")
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\n❌ ERROR checking ODBC drivers: {str(e)}\n")
+                f.flush()
+        
+        # Run the comprehensive connection test
+        print("\n3. SQL CONNECTION TEST:")
+        with open(OUTPUT_FILE, "a") as f:
+            f.write("\n3. SQL CONNECTION TEST:\n")
+            f.flush()
+        
+        connection_ok = await self.test_sql_connection(session)
+        
+        # Get schema summary (if available)
+        print("\n4. SCHEMA STATUS:")
+        if self.schema_summary:
+            print("✅ Schema summary available:")
+            print(self.schema_summary[:300] + "..." if len(self.schema_summary) > 300 else self.schema_summary)
+            
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n4. SCHEMA STATUS:\n")
+                f.write("✅ Schema summary available:\n")
+                f.write(self.schema_summary[:500] + "..." if len(self.schema_summary) > 500 else self.schema_summary)
+                f.write("\n")
+                f.flush()
+        else:
+            print("❌ Schema summary not available")
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n4. SCHEMA STATUS:\n")
+                f.write("❌ Schema summary not available\n")
+                f.flush()
+        
+        # Show system status
+        print("\n5. SYSTEM STATUS:")
+        import platform
+        print(f"   OS: {platform.system()} {platform.version()}")
+        print(f"   Python: {platform.python_version()}")
+        
+        with open(OUTPUT_FILE, "a") as f:
+            f.write("\n5. SYSTEM STATUS:\n")
+            f.write(f"   OS: {platform.system()} {platform.version()}\n")
+            f.write(f"   Python: {platform.python_version()}\n")
+            f.flush()
+        
+        # Final diagnostic summary
+        print("\n===== DIAGNOSTIC SUMMARY =====")
+        if connection_ok:
+            print("✅ SQL CONNECTION: Working properly")
+        else:
+            print("❌ SQL CONNECTION: Not working")
+        
+        if self.schema_summary:
+            print("✅ SCHEMA: Available")
+        else:
+            print("❌ SCHEMA: Not available")
+        
+        with open(OUTPUT_FILE, "a") as f:
+            f.write("\n===== DIAGNOSTIC SUMMARY =====\n")
+            if connection_ok:
+                f.write("✅ SQL CONNECTION: Working properly\n")
+            else:
+                f.write("❌ SQL CONNECTION: Not working\n")
+            
+            if self.schema_summary:
+                f.write("✅ SCHEMA: Available\n")
+            else:
+                f.write("❌ SCHEMA: Not available\n")
+            
+            f.write("\nTroubleshooting steps if you have issues:\n")
+            f.write("1. Check that all environment variables are correctly set in your .env file\n")
+            f.write("2. Verify that the SQL Server is running and accessible\n")
+            f.write("3. Ensure you have the correct ODBC driver installed\n")
+            f.write("4. Verify table exists and permissions are correct\n")
+            f.write("5. Verify network connectivity if using a remote SQL Server\n")
+            f.write("6. Try running /refresh_schema to reload the schema\n")
+            f.flush()
+        
+        print("\nDiagnostics complete.")
+        print("If you're experiencing issues:")
+        print("1. Check environment variables in your .env file")
+        print("2. Verify SQL Server is running and accessible")
+        print("3. Ensure proper ODBC driver is installed")
+        print("4. Verify table exists and permissions are correct")
         print("===============================\n")
 
     async def show_recent_logs(self, session: ClientSession, n: int = 5):
@@ -1345,6 +1559,146 @@ Schema retrieval encountered errors. Limited table information available:
                 # Sleep briefly to avoid busy-waiting in case of persistent errors
                 await asyncio.sleep(1)
 
+    async def test_sql_connection(self, session: ClientSession) -> bool:
+        """
+        Performs a comprehensive SQL connection test and displays the results.
+        Returns True if connection is successful, False otherwise.
+        """
+        try:
+            print("\n===== TESTING SQL CONNECTION =====")
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n===== TESTING SQL CONNECTION =====\n")
+                f.write("Running comprehensive connection diagnostics...\n")
+                f.flush()
+            
+            # Call the test_connection tool which will check each layer of connectivity
+            logger.info("Calling test_connection tool for comprehensive diagnostics")
+            test_result = await session.call_tool("test_connection", {})
+            test_output = getattr(test_result.content[0], "text", "")
+            
+            # Log the full test output for diagnostics
+            logger.info("Connection test complete, full results:\n" + test_output)
+            
+            # Display the test results
+            print("\n" + test_output)
+            
+            # Write comprehensive results to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n=== CONNECTION TEST RESULTS ===\n")
+                f.write(test_output)
+                f.write("\n================================\n")
+            
+            # Parse the test output to determine success/failure
+            if "❌" in test_output:
+                # Extract specific error for focused debugging
+                error_lines = [line for line in test_output.split('\n') if "❌" in line]
+                
+                logger.error(f"Connection test failed with {len(error_lines)} errors")
+                for err in error_lines:
+                    logger.error(f"Connection error: {err}")
+                
+                # Identify the primary issue for the user
+                primary_issue = "Unknown connection issue"
+                if any("Server connection failed" in line for line in error_lines):
+                    primary_issue = "Cannot connect to SQL Server - server may be unreachable or credentials incorrect"
+                elif any("Database connection failed" in line for line in error_lines):
+                    primary_issue = "Cannot connect to database - database may not exist or user lacks permission"
+                elif any("table existence" in line.lower() for line in error_lines):
+                    primary_issue = "Table not found - check table name and schema"
+                elif any("accessing table" in line.lower() for line in error_lines):
+                    primary_issue = "Cannot access table - user may lack SELECT permission"
+                
+                # Display a focused error message
+                print(f"\nCONNECTION ERROR: {primary_issue}")
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"\nCONNECTION ERROR: {primary_issue}\n")
+                    f.write("Please fix this issue before proceeding.\n")
+                    f.write("You can run the /diagnose command for more details.\n")
+                
+                return False
+            else:
+                print("\nConnection test PASSED!")
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write("\nConnection test successful!\n")
+                    f.flush()
+                return True
+            
+        except Exception as e:
+            logger.error(f"Error running connection test: {e}", exc_info=True)
+            print(f"\nError running connection test: {e}")
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\nError running connection test: {e}\n")
+                f.flush()
+            return False
+
+    async def fetch_data_preview(self, session: ClientSession) -> None:
+        """Fetch a preview of the data (first row) to verify SQL connection."""
+        print(f"\n===== FETCHING DATA PREVIEW FOR {FULLY_QUALIFIED_TABLE_NAME} =====")
+        
+        # First validate connection parameters
+        if not validate_sql_connection_params():
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n===== CONNECTION PARAMETER ERROR =====\n")
+                f.write("SQL Server connection cannot be established due to missing parameters.\n")
+                f.write("Please check your .env file and ensure all required variables are set.\n")
+                f.write("Required parameters:\n")
+                f.write("- MSSQL_SERVER\n")
+                f.write("- MSSQL_DATABASE\n")
+                f.write("- MSSQL_USERNAME\n")
+                f.write("- MSSQL_PASSWORD\n")
+                f.write("- MSSQL_DRIVER (or a system ODBC driver must be available)\n")
+                f.write("================================\n")
+            return False
+        
+        # Start by testing the SQL connection thoroughly
+        connection_ok = await self.test_sql_connection(session)
+        if not connection_ok:
+            logger.error("SQL connection test failed, aborting data preview")
+            return False
+        
+        try:
+            # Now that connection is verified, try running a simple preview query
+            preview_sql = f"SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}"
+            print(f"Executing preview query: {preview_sql}")
+            
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\nExecuting data preview query: {preview_sql}\n")
+                f.flush()
+            
+            # Execute query
+            result = await session.call_tool("query_table", {"sql": preview_sql})
+            preview_data = getattr(result.content[0], "text", "")
+            
+            # Check if the result contains error message
+            if preview_data.startswith("Error:") or "Error retrieving data" in preview_data:
+                raise Exception(preview_data)
+            
+            # Write to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n===== DATA PREVIEW =====\n")
+                f.write("Showing first 5 rows of data to verify connection:\n\n")
+                f.write(preview_data)
+                f.write("\n========================\n")
+            
+            print("Data preview fetched successfully:")
+            print(preview_data)
+            print("==================================\n")
+            return True
+        except Exception as e:
+            error_message = f"Error fetching data preview: {str(e)}"
+            print(f"\n===== DATA PREVIEW ERROR =====")
+            print(error_message)
+            print("==============================\n")
+            
+            # Write detailed error to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n===== DATA PREVIEW ERROR =====\n")
+                f.write(f"Failed to fetch data preview: {str(e)}\n\n")
+                f.write("This may indicate connection issues with the SQL server.\n\n")
+                f.write("Try running /diagnose for more information.\n")
+                f.write("==============================\n")
+            return False
+
     async def run(self):
         """Main entry point to run the chat session."""
         try:
@@ -1388,6 +1742,19 @@ Schema retrieval encountered errors. Limited table information available:
                     f.write("This usually indicates a network connectivity issue to the SQL Server.\n")
                     f.write("Please check your SQL Server connection settings and network connectivity.\n")
             
+            # First validate SQL connection through explicit testing
+            connection_ok = await self.test_sql_connection(session)
+            if not connection_ok:
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write("\n===== CONNECTION FAILURE =====\n")
+                    f.write("CRITICAL: Cannot establish SQL connection.\n")
+                    f.write("The SQL Table Assistant requires a working SQL connection to function.\n")
+                    f.write("Please fix the connection issues before proceeding.\n\n")
+                    f.write("You may continue in limited mode, but SQL queries will fail.\n")
+                    f.write("==============================\n")
+                    f.write("\nEnter your Query (or type /exit to quit): ")
+                    f.flush()
+            
             # Fetch schema information with timeout
             print("Fetching schema information...")
             with open(OUTPUT_FILE, "a") as f:
@@ -1411,28 +1778,6 @@ Schema retrieval encountered errors. Limited table information available:
                     self.system_prompt = self.system_prompt.replace("{schema_summary}", self.schema_summary)
                     self.system_prompt = self.system_prompt.replace("{table_name}", FULLY_QUALIFIED_TABLE_NAME)
             
-            # Fetch and display a data preview to verify database connection
-            print("Fetching data preview...")
-            with open(OUTPUT_FILE, "a") as f:
-                f.write("\nAttempting to fetch data preview...\n")
-                
-            preview_task = asyncio.create_task(self.fetch_data_preview(session))
-            try:
-                await asyncio.wait_for(preview_task, timeout=30)
-                print("Data preview fetched successfully.")
-            except asyncio.TimeoutError:
-                print("Data preview fetch timed out after 30 seconds")
-                with open(OUTPUT_FILE, "a") as f:
-                    f.write("\nDATA PREVIEW TIMEOUT\n")
-                    f.write("The data preview retrieval process timed out after 30 seconds.\n")
-                    f.write("Unable to verify database connection.\n")
-                    f.write("=== CONNECTION TROUBLESHOOTING ===\n")
-                    f.write(f"1. Verify SQL Server '{os.getenv('MSSQL_SERVER', 'Not set')}' is reachable\n")
-                    f.write(f"2. Verify database '{os.getenv('MSSQL_DATABASE', 'Not set')}' exists and is online\n")
-                    f.write(f"3. Check credentials and permissions for '{os.getenv('MSSQL_USERNAME', 'current user')}'\n")
-                    f.write(f"4. Verify table '{FULLY_QUALIFIED_TABLE_NAME}' exists in the database\n")
-                    f.write("=================================\n")
-            
             # Start the interactive chat loop
             print("Starting chat loop...")
             await self.chat_loop(session)
@@ -1452,120 +1797,6 @@ Schema retrieval encountered errors. Limited table information available:
                 f.write("3. Proper installation of SQL Server drivers\n")
                 f.write("4. Table name and permissions\n")
                 f.write("===========================\n")
-
-    async def fetch_data_preview(self, session: ClientSession) -> None:
-        """Fetch a preview of the data (first row) to verify SQL connection."""
-        print(f"\n===== FETCHING DATA PREVIEW FOR {FULLY_QUALIFIED_TABLE_NAME} =====")
-        try:
-            # Write to output file first to let user know we're checking the connection
-            with open(OUTPUT_FILE, "a") as f:
-                f.write("\n===== CHECKING DATABASE CONNECTION =====\n")
-                f.write(f"Connecting to table: {FULLY_QUALIFIED_TABLE_NAME}\n")
-                f.write(f"Connection parameters:\n")
-                f.write(f"Server: {os.getenv('MSSQL_SERVER', 'Not set')}\n")
-                f.write(f"Database: {os.getenv('MSSQL_DATABASE', 'Not set')}\n")
-                f.write(f"Username: {os.getenv('MSSQL_USERNAME', 'Not set (using Windows Auth)')}\n")
-                f.write(f"ODBC Driver: {os.getenv('MSSQL_DRIVER', 'Not set')}\n")
-                f.write("Fetching sample data...\n")
-            
-            # Try a connection test query first
-            print("Attempting direct connection test...")
-            with open(OUTPUT_FILE, "a") as f:
-                f.write("Attempting direct connection test...\n")
-                
-            try:
-                print("Calling test_connection tool...")
-                test_result = await session.call_tool("test_connection", {})
-                print("test_connection tool returned")
-                test_status = getattr(test_result.content[0], "text", "")
-                
-                with open(OUTPUT_FILE, "a") as f:
-                    f.write(f"\n--- Connection Test Result ---\n{test_status}\n\n")
-                
-                if "Connection failed" in test_status:
-                    print(f"SQL Server connection test failed: {test_status}")
-                    raise Exception(f"SQL Server connection test failed: {test_status}")
-                
-                print(f"Connection test result: {test_status}")
-            except Exception as conn_err:
-                print(f"Connection test error: {conn_err}")
-                with open(OUTPUT_FILE, "a") as f:
-                    f.write(f"Connection test error: {conn_err}\n")
-                # Continue anyway to get more specific error
-
-            # Simple query to get top 5 rows with all fields
-            preview_sql = f"SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}"
-            print(f"Executing preview query: {preview_sql}")
-            
-            with open(OUTPUT_FILE, "a") as f:
-                f.write(f"Executing query: {preview_sql}\n")
-            
-            # Execute query
-            print("Calling query_table tool...")
-            result = await session.call_tool("query_table", {"sql": preview_sql})
-            print("query_table tool returned")
-            preview_data = getattr(result.content[0], "text", "")
-            
-            # Check if the result contains error message
-            if preview_data.startswith("Error:") or "Error retrieving data" in preview_data:
-                print(f"Error in preview data: {preview_data}")
-                with open(OUTPUT_FILE, "a") as f:
-                    f.write(f"Error in preview query: {preview_data}\n")
-                raise Exception(preview_data)
-            
-            # Write to output file
-            with open(OUTPUT_FILE, "a") as f:
-                f.write("\n===== DATA PREVIEW =====\n")
-                f.write("Showing first 5 rows of data to verify connection:\n\n")
-                f.write(preview_data)
-                f.write("\n========================\n")
-            
-            print("Data preview fetched successfully:")
-            print(preview_data)
-            print("==================================\n")
-            return True
-        except Exception as e:
-            error_message = f"Error fetching data preview: {str(e)}"
-            print(f"\n===== DATA PREVIEW ERROR =====")
-            print(error_message)
-            print("Full exception details:", repr(e))
-            print("==============================\n")
-            
-            # Get diagnostic information
-            try:
-                # Try to run diagnostics to get more info
-                print("Calling diagnose_table_access tool...")
-                diag_result = await session.call_tool("diagnose_table_access", {})
-                print("diagnose_table_access tool returned")
-                diagnostics = getattr(diag_result.content[0], "text", "")
-            except Exception as diag_error:
-                diagnostics = f"Could not retrieve diagnostics information: {str(diag_error)}"
-                print(f"Diagnostics error: {diag_error}")
-            
-            # Write detailed error to output file
-            with open(OUTPUT_FILE, "a") as f:
-                f.write("\n===== DATA PREVIEW ERROR =====\n")
-                f.write(f"Failed to fetch data preview: {str(e)}\n\n")
-                f.write("This may indicate connection issues with the SQL server.\n\n")
-                f.write("===== CONNECTION DETAILS =====\n")
-                f.write(f"Table: {FULLY_QUALIFIED_TABLE_NAME}\n")
-                f.write(f"Server: {os.getenv('MSSQL_SERVER', 'Not configured')}\n")
-                f.write(f"Database: {os.getenv('MSSQL_DATABASE', 'Not configured')}\n")
-                f.write(f"Username: {os.getenv('MSSQL_USERNAME', 'Not configured (using Windows Auth)')}\n")
-                f.write(f"Password: {'[PROVIDED]' if os.getenv('MSSQL_PASSWORD') else 'Not configured'}\n")
-                f.write(f"Driver: {os.getenv('MSSQL_DRIVER', 'Not configured')}\n")
-                f.write(f"Authentication: Using {'SQL Server Authentication' if os.getenv('MSSQL_USERNAME') else 'Windows Authentication'}\n\n")
-                f.write("===== DIAGNOSTICS =====\n")
-                f.write(diagnostics + "\n\n")
-                f.write("===== TROUBLESHOOTING STEPS =====\n")
-                f.write("1. Verify the table name is correct and exists\n")
-                f.write("2. Check that database credentials are valid\n")
-                f.write("3. Ensure SQL Server is running and accessible\n")
-                f.write("4. Verify network connectivity to the SQL Server\n")
-                f.write("5. Check that SQL login has permissions to access the table\n")
-                f.write("6. Try running /diagnose command for more information\n")
-                f.write("==============================\n")
-            return False
 
 # Main entry point
 if __name__ == "__main__":

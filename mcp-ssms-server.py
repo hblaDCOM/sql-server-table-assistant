@@ -40,6 +40,43 @@ MSSQL_USERNAME = os.getenv("MSSQL_USERNAME", "sa")
 MSSQL_PASSWORD = os.getenv("MSSQL_PASSWORD", "your_password")
 MSSQL_DRIVER = os.getenv("MSSQL_DRIVER", "{ODBC Driver 18 for SQL Server}")
 
+# Check for ODBC drivers
+def check_odbc_drivers():
+    """Check if the specified ODBC driver is available"""
+    try:
+        available_drivers = pyodbc.drivers()
+        logger.info(f"Available ODBC drivers: {available_drivers}")
+        
+        # Check if our driver is in the list (exact match)
+        driver_name = MSSQL_DRIVER.strip("{}")  # Remove curly braces
+        if driver_name in available_drivers:
+            logger.info(f"Found exact driver match: {driver_name}")
+            return True
+            
+        # Check for partial matches, which might work on some systems
+        for driver in available_drivers:
+            if "SQL Server" in driver:
+                logger.info(f"Found SQL Server driver: {driver}")
+                logger.warning(f"Using alternative driver: {driver} instead of {MSSQL_DRIVER}")
+                global MSSQL_DRIVER
+                MSSQL_DRIVER = '{' + driver + '}'
+                return True
+                
+        logger.error(f"SQL Server ODBC driver not found. Available drivers: {available_drivers}")
+        print(f"ERROR: SQL Server ODBC driver '{MSSQL_DRIVER}' not found.")
+        print(f"Available drivers: {available_drivers}")
+        print("Please install the appropriate ODBC driver or correct the MSSQL_DRIVER environment variable.")
+        return False
+    except Exception as e:
+        logger.error(f"Error checking ODBC drivers: {e}")
+        return False
+
+# Call the driver check function
+driver_available = check_odbc_drivers()
+if not driver_available:
+    print("WARNING: ODBC driver check failed. SQL connection might not work.")
+    logger.warning("ODBC driver check failed. Continuing but SQL connection might fail.")
+
 # Table configuration
 MSSQL_TABLE_SCHEMA = os.getenv("MSSQL_TABLE_SCHEMA", "dbo")
 MSSQL_TABLE_NAME = os.getenv("MSSQL_TABLE_NAME", "your_table_name")
@@ -479,8 +516,18 @@ def query_table(sql: str) -> str:
     
     conn = None
     try:
-        conn = pyodbc.connect(connection_string)
+        # Set an explicit timeout for connection
+        logger.debug("Attempting to connect with explicit timeout (30 seconds)")
+        conn = pyodbc.connect(connection_string, timeout=30)
+        
         cursor = conn.cursor()
+        
+        # Set query timeout to prevent long-running queries
+        cursor.execute("SET QUERY_GOVERNOR_COST_LIMIT 0")  # Remove cost-based limitations
+        cursor.execute("SET LOCK_TIMEOUT 10000")  # 10 seconds lock timeout
+        cursor.execute("SET QUERY_TIMEOUT 20000")  # 20 seconds query timeout
+        
+        logger.debug(f"Executing SQL: {sql}")
         cursor.execute(sql)
         
         # For SELECT queries, format results as tabular data
@@ -921,7 +968,255 @@ def get_recent_query_logs(num_logs: int = 5) -> str:
         logger.error(f"Error retrieving query logs: {str(e)}", exc_info=True)
         return f"Error retrieving query logs: {str(e)}"
 
+@mcp.tool()
+def test_connection() -> str:
+    """Test SQL Server connection and provide detailed diagnostics."""
+    logger.info("Running connection test to SQL Server...")
+    results = []
+    
+    # Log environment variables securely
+    results.append(f"SERVER CONNECTION TEST")
+    results.append(f"-------------------")
+    results.append(f"Server: {MSSQL_SERVER}")
+    results.append(f"Database: {MSSQL_DATABASE}")
+    results.append(f"Username: {MSSQL_USERNAME}")
+    results.append(f"Driver: {MSSQL_DRIVER}")
+    results.append(f"Table: {FULLY_QUALIFIED_TABLE_NAME}")
+    results.append(f"-------------------")
+    
+    # Log available drivers
+    try:
+        drivers = pyodbc.drivers()
+        results.append(f"Available ODBC drivers: {', '.join(drivers)}")
+        
+        if not any('SQL Server' in driver for driver in drivers):
+            results.append("❌ WARNING: No SQL Server ODBC drivers found on this system")
+            results.append("   Install the Microsoft ODBC Driver for SQL Server")
+    except Exception as e:
+        results.append(f"❌ Error getting ODBC drivers: {str(e)}")
+    
+    # Test basic connectivity first (without database)
+    try:
+        logger.debug("Testing basic server connectivity without database...")
+        results.append("\nSTEP 1: Testing basic server connectivity (no database)")
+        
+        # Build minimal connection string for server only
+        server_conn_string = (
+            f"DRIVER={MSSQL_DRIVER};"
+            f"SERVER={MSSQL_SERVER};"
+            f"UID={MSSQL_USERNAME};"
+            f"PWD={MSSQL_PASSWORD};"
+            f"Authentication=SqlPassword;"
+            f"Encrypt=yes;"
+            f"TrustServerCertificate=yes;"
+            f"Connection Timeout=10"
+        )
+        
+        try:
+            logger.debug("Attempting to connect to server only...")
+            results.append("Attempting to connect to server only...")
+            
+            # Try to connect to just the server
+            server_conn = pyodbc.connect(server_conn_string, timeout=10)
+            server_cursor = server_conn.cursor()
+            
+            # Simple test query
+            server_cursor.execute("SELECT @@VERSION")
+            version = server_cursor.fetchone()[0]
+            
+            results.append("✅ Basic server connection successful")
+            results.append(f"SQL Server version: {version[:50]}...")
+            server_conn.close()
+        except Exception as server_err:
+            results.append(f"❌ Server connection failed: {str(server_err)}")
+            results.append(f"   This indicates a problem connecting to the SQL Server instance")
+            results.append(f"   Check network connectivity, firewall settings, and server name")
+            # Early return since we can't even connect to the server
+            return "\n".join(results)
+    except Exception as e:
+        results.append(f"❌ Error in server connectivity test: {str(e)}")
+        return "\n".join(results)
+    
+    # Test database connectivity
+    try:
+        logger.debug("Testing database connectivity...")
+        results.append("\nSTEP 2: Testing database connectivity")
+        
+        # Build connection string with database
+        db_conn_string = (
+            f"DRIVER={MSSQL_DRIVER};"
+            f"SERVER={MSSQL_SERVER};"
+            f"DATABASE={MSSQL_DATABASE};"
+            f"UID={MSSQL_USERNAME};"
+            f"PWD={MSSQL_PASSWORD};"
+            f"Authentication=SqlPassword;"
+            f"Encrypt=yes;"
+            f"TrustServerCertificate=yes;"
+            f"Connection Timeout=10"
+        )
+        
+        try:
+            logger.debug("Attempting database connection...")
+            results.append("Attempting to connect to database...")
+            
+            # Create connection with explicit timeout
+            db_conn = pyodbc.connect(db_conn_string, timeout=10)
+            
+            # Test basic connectivity
+            db_cursor = db_conn.cursor()
+            db_cursor.execute("SELECT DB_NAME()")
+            db_name = db_cursor.fetchone()[0]
+            
+            results.append(f"✅ Database connection successful: '{db_name}'")
+            
+            # Check if connected to correct database
+            if db_name.lower() != MSSQL_DATABASE.lower():
+                results.append(f"⚠️ Warning: Connected to database '{db_name}' but expected '{MSSQL_DATABASE}'")
+            
+            db_conn.close()
+        except Exception as db_err:
+            results.append(f"❌ Database connection failed: {str(db_err)}")
+            results.append(f"   This indicates a problem with the database access")
+            results.append(f"   Check that database '{MSSQL_DATABASE}' exists and user has access")
+            # Early return since we can't connect to the database
+            return "\n".join(results)
+    except Exception as e:
+        results.append(f"❌ Error in database connectivity test: {str(e)}")
+        return "\n".join(results)
+    
+    # Test table existence
+    try:
+        logger.debug("Testing table existence...")
+        results.append("\nSTEP 3: Testing table existence")
+        
+        # Create connection with the full string
+        conn = pyodbc.connect(connection_string, timeout=10)
+        cursor = conn.cursor()
+        
+        # Try different ways to verify table existence
+        try:
+            results.append(f"Checking if table '{FULLY_QUALIFIED_TABLE_NAME}' exists...")
+            
+            # Method 1: Using INFORMATION_SCHEMA
+            cursor.execute(f"""
+                SELECT COUNT(*) 
+                FROM INFORMATION_SCHEMA.TABLES 
+                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+            """, (MSSQL_TABLE_SCHEMA, MSSQL_TABLE_NAME))
+            
+            count = cursor.fetchone()[0]
+            if count > 0:
+                results.append(f"✅ Table exists in INFORMATION_SCHEMA (Count: {count})")
+            else:
+                results.append(f"❌ Table NOT found in INFORMATION_SCHEMA")
+                
+                # Method 2: Try sys.tables
+                try:
+                    cursor.execute(f"""
+                        SELECT COUNT(*) FROM sys.tables t
+                        JOIN sys.schemas s ON t.schema_id = s.schema_id
+                        WHERE s.name = ? AND t.name = ?
+                    """, (MSSQL_TABLE_SCHEMA, MSSQL_TABLE_NAME))
+                    
+                    sys_count = cursor.fetchone()[0]
+                    if sys_count > 0:
+                        results.append(f"✅ Table found in sys.tables (Count: {sys_count})")
+                    else:
+                        results.append(f"❌ Table NOT found in sys.tables")
+                        
+                        # Method 3: Try direct schema enumeration
+                        results.append("Checking available tables in schema...")
+                        try:
+                            cursor.execute(f"""
+                                SELECT TOP 10 t.name 
+                                FROM sys.tables t
+                                JOIN sys.schemas s ON t.schema_id = s.schema_id
+                                WHERE s.name = ?
+                            """, (MSSQL_TABLE_SCHEMA,))
+                            
+                            tables = [row[0] for row in cursor.fetchall()]
+                            if tables:
+                                results.append(f"Available tables in schema '{MSSQL_TABLE_SCHEMA}': {', '.join(tables)}")
+                            else:
+                                results.append(f"No tables found in schema '{MSSQL_TABLE_SCHEMA}'")
+                                
+                                # Method 4: Check if schema exists
+                                cursor.execute(f"""
+                                    SELECT COUNT(*) FROM sys.schemas WHERE name = ?
+                                """, (MSSQL_TABLE_SCHEMA,))
+                                
+                                schema_count = cursor.fetchone()[0]
+                                if schema_count > 0:
+                                    results.append(f"✅ Schema '{MSSQL_TABLE_SCHEMA}' exists but contains no tables")
+                                else:
+                                    results.append(f"❌ Schema '{MSSQL_TABLE_SCHEMA}' does NOT exist")
+                                    
+                                    # Method 5: List available schemas
+                                    cursor.execute("SELECT TOP 10 name FROM sys.schemas")
+                                    schemas = [row[0] for row in cursor.fetchall()]
+                                    results.append(f"Available schemas: {', '.join(schemas)}")
+                        except Exception as tables_err:
+                            results.append(f"❌ Error checking available tables: {str(tables_err)}")
+                except Exception as sys_err:
+                    results.append(f"❌ Error checking sys.tables: {str(sys_err)}")
+        except Exception as exists_err:
+            results.append(f"❌ Error checking table existence: {str(exists_err)}")
+    
+        # Test table access (if we got this far)
+        try:
+            results.append("\nSTEP 4: Testing table access")
+            results.append(f"Attempting to SELECT from table '{FULLY_QUALIFIED_TABLE_NAME}'...")
+            
+            cursor.execute(f"SELECT TOP 1 * FROM {FULLY_QUALIFIED_TABLE_NAME}")
+            column_names = [column[0] for column in cursor.description]
+            results.append(f"✅ Successfully executed SELECT query")
+            results.append(f"Table columns: {', '.join(column_names[:5])}...")
+            
+            # Check row count
+            cursor.execute(f"SELECT COUNT(*) FROM {FULLY_QUALIFIED_TABLE_NAME}")
+            row_count = cursor.fetchone()[0]
+            results.append(f"Total rows in table: {row_count}")
+            
+        except Exception as access_err:
+            results.append(f"❌ Error accessing table: {str(access_err)}")
+            results.append(f"   This indicates a permission issue or the table doesn't exist")
+            
+        # Clean up connection
+        conn.close()
+        
+    except Exception as e:
+        results.append(f"❌ Error in table existence test: {str(e)}")
+    
+    # Final summary
+    results.append("\nCONNECTION TEST SUMMARY")
+    results.append("=====================")
+    
+    if "❌" in "\n".join(results):
+        results.append("⚠️ CONNECTION TEST FAILED: Issues were detected during testing")
+        results.append("Review the details above to identify the specific problem")
+    else:
+        results.append("✅ ALL TESTS PASSED: Connection to SQL Server and table successful")
+    
+    return "\n".join(results)
+
 # Run our server
 if __name__ == "__main__":
-    logger.info("MCP SQL Server is starting up")
-    mcp.run()
+    if not driver_available:
+        print("\n----- SQL CONNECTION WARNING -----")
+        print("The ODBC driver check failed. The application might not be able to connect to SQL Server.")
+        print("If you experience connection issues, please:")
+        print("1. Install the Microsoft ODBC Driver for SQL Server")
+        print("2. Check your .env file and set the correct MSSQL_DRIVER value")
+        print("3. Restart the application")
+        print("--------------------------------\n")
+        
+    try:
+        print(f"MCP SQL Server running with table: {FULLY_QUALIFIED_TABLE_NAME}")
+        print(f"Press Ctrl+C to exit")
+        # Start the server
+        mcp.run()
+    except KeyboardInterrupt:
+        print("Shutting down gracefully...")
+    except Exception as e:
+        logger.error(f"Error starting server: {e}", exc_info=True)
+        print(f"Error starting server: {e}")
