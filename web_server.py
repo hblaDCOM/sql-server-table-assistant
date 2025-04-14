@@ -459,12 +459,18 @@ def start_client_process(uid, sid):
     # Create a background process runner
     def run_process():
         try:
+            # Get SQL table name from environment
+            table_schema = os.getenv("MSSQL_TABLE_SCHEMA", "dbo")
+            table_name = os.getenv("MSSQL_TABLE_NAME", "YourTableName")
+            fully_qualified_table_name = f"{table_schema}.{table_name}" if table_schema else table_name
+            
             # Command to run the client script
             cmd = [
                 sys.executable,  # Python executable
                 "./mcp-ssms-client-file.py",  # Client script
                 input_path,      # Input file path as first argument
-                output_path      # Output file path as second argument
+                output_path,     # Output file path as second argument
+                fully_qualified_table_name  # Pass the fully qualified table name as third argument
             ]
             
             print(f"Starting process with command: {' '.join(cmd)}")
@@ -475,7 +481,8 @@ def start_client_process(uid, sid):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
-                bufsize=1  # Line buffered
+                bufsize=1,  # Line buffered
+                env=os.environ.copy()  # Pass current environment variables
             )
             
             # Update session data with process info

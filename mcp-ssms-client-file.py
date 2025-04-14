@@ -20,12 +20,21 @@ client = AzureOpenAI(
 
 # Get the table name from environment variables or use a default
 # Also check command line arguments for table name (position 3)
-if len(sys.argv) >= 4:
-    FULLY_QUALIFIED_TABLE_NAME = sys.argv[3]
-else:
-    FULLY_QUALIFIED_TABLE_NAME = os.getenv("SQL_TABLE_NAME", "dbo.YourTableName")
+print(f"Received arguments: {sys.argv}")
+print(f"Environment MSSQL_TABLE_SCHEMA: {os.getenv('MSSQL_TABLE_SCHEMA', 'Not set')}")
+print(f"Environment MSSQL_TABLE_NAME: {os.getenv('MSSQL_TABLE_NAME', 'Not set')}")
 
-print(f"Using table: {FULLY_QUALIFIED_TABLE_NAME}")
+if len(sys.argv) >= 4 and sys.argv[3] and sys.argv[3] != "None":
+    FULLY_QUALIFIED_TABLE_NAME = sys.argv[3]
+    print(f"Using table name from command line arg: {FULLY_QUALIFIED_TABLE_NAME}")
+else:
+    # Construct table name from environment variables
+    table_schema = os.getenv("MSSQL_TABLE_SCHEMA", "dbo")
+    table_name = os.getenv("MSSQL_TABLE_NAME", "YourTableName")
+    FULLY_QUALIFIED_TABLE_NAME = f"{table_schema}.{table_name}" if table_schema else table_name
+    print(f"Using table name from environment variables: {FULLY_QUALIFIED_TABLE_NAME}")
+
+print(f"Final table name: {FULLY_QUALIFIED_TABLE_NAME}")
 
 # Parse command line arguments for input/output files
 if len(sys.argv) >= 3:
