@@ -763,18 +763,22 @@ Schema retrieval encountered errors. Limited table information available:
         # Write initial welcome message to output
         with open(OUTPUT_FILE, "w") as f:
             f.write(f"\nTable Assistant is ready. You are working with table: {FULLY_QUALIFIED_TABLE_NAME}\n")
+            f.write("A data preview has been displayed above to verify the database connection.\n")
             f.write("Type your questions about the table in natural language, and I'll translate them to SQL.\n")
             f.write("Special commands:\n")
             f.write("  /diagnose - Run diagnostics\n")
             f.write("  /refresh_schema - Refresh table schema\n")
+            f.write("  /preview - Show data preview again\n")
             f.write("  /history - View query history\n")
             f.write("  /show-logs [n] - View recent query logs (default: 5)\n\n")
         
         print(f"\nTable Assistant is ready. You are working with table: {FULLY_QUALIFIED_TABLE_NAME}")
+        print("A data preview has been displayed above to verify the database connection.")
         print("Type your questions about the table in natural language, and I'll translate them to SQL.")
         print("Special commands:")
         print("  /diagnose - Run diagnostics")
         print("  /refresh_schema - Refresh table schema")
+        print("  /preview - Show data preview again")
         print("  /history - View query history")
         print("  /show-logs [n] - View recent query logs (default: 5)")
         
@@ -800,6 +804,9 @@ Schema retrieval encountered errors. Limited table information available:
                     continue
                 elif query.lower() == "/refresh_schema":
                     await self.fetch_schema(session)
+                    continue
+                elif query.lower() == "/preview":
+                    await self.fetch_data_preview(session)
                     continue
                 elif query.lower() == "/history":
                     await self.show_query_history()
@@ -840,12 +847,49 @@ Schema retrieval encountered errors. Limited table information available:
             # Fetch schema information before starting chat loop
             await self.fetch_schema(session)
             
+            # Fetch and display a data preview to verify database connection
+            await self.fetch_data_preview(session)
+            
             # Start the interactive chat loop
             await self.chat_loop(session)
         except Exception as e:
             print(f"Error running chat: {e}")
             import traceback
             traceback.print_exc()
+
+    async def fetch_data_preview(self, session: ClientSession) -> None:
+        """Fetch a preview of the data (first row) to verify SQL connection."""
+        print(f"\n===== FETCHING DATA PREVIEW FOR {FULLY_QUALIFIED_TABLE_NAME} =====")
+        try:
+            # Simple query to get top 1 row with all fields
+            preview_sql = f"SELECT TOP 1 * FROM {FULLY_QUALIFIED_TABLE_NAME}"
+            result = await session.call_tool("query_table", {"sql": preview_sql})
+            preview_data = getattr(result.content[0], "text", "")
+            
+            # Write to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n===== DATA PREVIEW =====\n")
+                f.write("Showing first row of data to verify connection:\n\n")
+                f.write(preview_data)
+                f.write("\n========================\n")
+            
+            print("Data preview fetched successfully:")
+            print(preview_data)
+            print("==================================\n")
+            return True
+        except Exception as e:
+            error_message = f"Error fetching data preview: {str(e)}"
+            print(f"\n===== DATA PREVIEW ERROR =====")
+            print(error_message)
+            print("==============================\n")
+            
+            # Write error to output file
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n===== DATA PREVIEW ERROR =====\n")
+                f.write(f"Failed to fetch data preview: {str(e)}\n")
+                f.write("This may indicate connection issues with the SQL server.\n")
+                f.write("==============================\n")
+            return False
 
 # Main entry point
 if __name__ == "__main__":
