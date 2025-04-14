@@ -215,3 +215,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# User-specific files
+Thumbs.db
