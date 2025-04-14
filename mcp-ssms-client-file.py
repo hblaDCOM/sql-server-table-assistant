@@ -290,8 +290,8 @@ class FileBasedClientSession:
         # Wait for tool result in input file
         print(f"Waiting for result of tool call: {tool_name}")
         
-        # Set up timeout handling
-        timeout_seconds = 45  # Reduced timeout to 45 seconds
+        # Set up timeout handling - use a longer timeout for test_connection
+        timeout_seconds = 90 if tool_name == "test_connection" else 45  # Increased timeout for connection testing
         start_time = time.time()
         last_progress_time = time.time()
         last_check_time = time.time()
@@ -327,9 +327,52 @@ class FileBasedClientSession:
         
         # Main waiting loop
         while True:
+            # Check for timeout
+            current_time = time.time()
+            if current_time - start_time > timeout_seconds:
+                error_msg = f"Timeout waiting for tool result after {timeout_seconds} seconds"
+                print(error_msg)
+                
+                # Clear the flag file
+                if os.path.exists(flag_file):
+                    try:
+                        os.remove(flag_file)
+                    except:
+                        pass
+                
+                # Write timeout to output file
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"\n{error_msg}\n")
+                    f.write("The operation may still be processing on the server.\n")
+                    f.flush()
+                
+                # Special handling for different tools
+                if tool_name == "test_connection":
+                    conn_error = "Connection failed: Timeout while waiting for SQL Server response. This typically indicates:\n"
+                    conn_error += "1. Network connectivity issues or firewall blocking the connection\n"
+                    conn_error += "2. SQL Server is unreachable or not running\n"
+                    conn_error += "3. SQL credentials are incorrect\n"
+                    conn_error += "4. The ODBC driver is incompatible or missing\n\n"
+                    conn_error += "Please check SQL Server settings in .env file and verify server connectivity."
+                    
+                    # Write detailed error to output
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write(f"\n===== SQL CONNECTION ERROR =====\n")
+                        f.write(conn_error + "\n")
+                        f.write("You can use the /diagnose command for more information.\n")
+                        f.write("==================================\n")
+                        f.flush()
+                    
+                    return MockResponse(conn_error)
+                elif tool_name == "get_table_schema":
+                    return MockResponse("Error retrieving schema: Connection timed out after 45 seconds. Please check SQL Server connectivity and that the table exists.")
+                elif tool_name == "query_table":
+                    return MockResponse(f"Error: SQL query execution timed out after 45 seconds. The query may be too complex or the server may be unresponsive.\nQuery: {args.get('sql', 'Unknown')}")
+                else:
+                    return MockResponse(f"Error: Timeout waiting for {tool_name} result")
+            
             try:
                 # Only check at reasonable intervals to reduce file operations
-                current_time = time.time()
                 if current_time - last_check_time < 0.3:  # Faster checks for more responsiveness
                     await asyncio.sleep(0.1)
                     continue
@@ -392,34 +435,6 @@ class FileBasedClientSession:
                 
                 # Return mock response with result
                 return MockResponse(result)
-                
-                # Check for timeout
-                if time.time() - start_time > timeout_seconds:
-                    error_msg = f"Timeout waiting for tool result after {timeout_seconds} seconds"
-                    print(error_msg)
-                    
-                    # Clear the flag file
-                    if os.path.exists(flag_file):
-                        try:
-                            os.remove(flag_file)
-                        except:
-                            pass
-                    
-                    # Write timeout to output file
-                    with open(OUTPUT_FILE, "a") as f:
-                        f.write(f"\n{error_msg}\n")
-                        f.write("The operation may still be processing on the server.\n")
-                        f.flush()
-                    
-                    # Special handling for different tools
-                    if tool_name == "test_connection":
-                        return MockResponse("Connection failed: Timeout while waiting for SQL Server response. This typically indicates network connectivity issues or that the SQL Server is unreachable.")
-                    elif tool_name == "get_table_schema":
-                        return MockResponse("Error retrieving schema: Connection timed out after 45 seconds. Please check SQL Server connectivity and that the table exists.")
-                    elif tool_name == "query_table":
-                        return MockResponse(f"Error: SQL query execution timed out after 45 seconds. The query may be too complex or the server may be unresponsive.\nQuery: {args.get('sql', 'Unknown')}")
-                    else:
-                        return MockResponse(f"Error: Timeout waiting for {tool_name} result")
                 
             except Exception as e:
                 print(f"Error waiting for tool result: {e}")
@@ -1571,7 +1586,13 @@ Schema retrieval encountered errors. Limited table information available:
                 f.write("Running comprehensive connection diagnostics...\n")
                 f.flush()
             
-            # Call the test_connection tool which will check each layer of connectivity
+            # First try a direct connection test (doesn't depend on server process)
+            direct_result = await self.direct_sql_test()
+            if not direct_result:
+                # If direct test fails, we know there's a fundamental connection issue
+                return False
+                
+            # If direct test succeeds, continue with the regular test for more details
             logger.info("Calling test_connection tool for comprehensive diagnostics")
             test_result = await session.call_tool("test_connection", {})
             test_output = getattr(test_result.content[0], "text", "")
@@ -1628,6 +1649,100 @@ Schema retrieval encountered errors. Limited table information available:
             print(f"\nError running connection test: {e}")
             with open(OUTPUT_FILE, "a") as f:
                 f.write(f"\nError running connection test: {e}\n")
+                f.flush()
+            return False
+            
+    async def direct_sql_test(self) -> bool:
+        """
+        Directly test SQL connectivity using pyodbc without relying on server process.
+        This helps identify if the issue is with the connection or the server process.
+        """
+        print("\n--- Direct SQL Connection Test ---")
+        with open(OUTPUT_FILE, "a") as f:
+            f.write("\n--- Direct SQL Connection Test ---\n")
+            f.write("Testing direct connection to SQL Server using pyodbc...\n")
+            f.flush()
+            
+        try:
+            # Build connection string - same as server side
+            connection_string = (
+                f"DRIVER={MSSQL_DRIVER};"
+                f"SERVER={MSSQL_SERVER};"
+                f"DATABASE={MSSQL_DATABASE};"
+                f"UID={MSSQL_USERNAME};"
+                f"PWD={MSSQL_PASSWORD};"
+                f"Authentication=SqlPassword;"
+                f"Encrypt=yes;"
+                f"TrustServerCertificate=yes;"
+                f"Connection Timeout=10"
+            )
+            
+            print(f"Attempting to connect to SQL Server: {MSSQL_SERVER}")
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"Connecting to: {MSSQL_SERVER}, Database: {MSSQL_DATABASE}\n")
+                f.write(f"Using driver: {MSSQL_DRIVER}\n")
+                f.flush()
+                
+            # Wrapped in a task with timeout to prevent hanging
+            async def try_connect():
+                # Run in a thread to not block asyncio
+                def connect_sync():
+                    try:
+                        conn = pyodbc.connect(connection_string, timeout=10)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT @@VERSION")
+                        version = cursor.fetchone()[0]
+                        conn.close()
+                        return True, version
+                    except Exception as e:
+                        return False, str(e)
+                
+                # Run the synchronous pyodbc code in a thread pool
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(None, connect_sync)
+            
+            # Execute with timeout
+            try:
+                success, result = await asyncio.wait_for(try_connect(), timeout=15)
+                
+                if success:
+                    version_summary = result[:100] + "..." if len(result) > 100 else result
+                    print(f"✅ Direct connection successful")
+                    print(f"SQL Server version: {version_summary}")
+                    
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write("✅ Direct connection successful\n")
+                        f.write(f"SQL Server version: {version_summary}\n")
+                        f.flush()
+                    return True
+                else:
+                    print(f"❌ Direct connection failed: {result}")
+                    
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write(f"❌ Direct connection failed: {result}\n")
+                        f.write("This indicates a fundamental connection issue with SQL Server.\n")
+                        f.write("Possible causes:\n")
+                        f.write("1. SQL Server is not running or unreachable\n") 
+                        f.write("2. Incorrect server name, credentials, or database\n")
+                        f.write("3. Firewall blocking the connection\n")
+                        f.write("4. ODBC driver issue\n")
+                        f.flush()
+                    return False
+            except asyncio.TimeoutError:
+                print(f"❌ Connection attempt timed out after 15 seconds")
+                
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"❌ Connection attempt timed out after 15 seconds\n")
+                    f.write("This typically indicates network connectivity issues\n")
+                    f.write("or that the SQL Server is unreachable.\n")
+                    f.flush()
+                return False
+                
+        except Exception as e:
+            print(f"❌ Error during direct connection test: {str(e)}")
+            
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"❌ Error during direct connection test: {str(e)}\n")
                 f.flush()
             return False
 
@@ -1742,18 +1857,50 @@ Schema retrieval encountered errors. Limited table information available:
                     f.write("This usually indicates a network connectivity issue to the SQL Server.\n")
                     f.write("Please check your SQL Server connection settings and network connectivity.\n")
             
-            # First validate SQL connection through explicit testing
-            connection_ok = await self.test_sql_connection(session)
+            # First validate SQL connection through explicit testing - with retries
+            connection_ok = False
+            max_retries = 3
+            
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    retry_delay = 5  # seconds
+                    print(f"\nRetrying SQL connection (attempt {attempt+1}/{max_retries}) after {retry_delay} seconds...")
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write(f"\nRetrying SQL connection (attempt {attempt+1}/{max_retries}) after {retry_delay} seconds...\n")
+                        f.flush()
+                    await asyncio.sleep(retry_delay)
+                
+                # Try direct test first (faster)
+                direct_ok = await self.direct_sql_test()
+                if direct_ok:
+                    # If direct test passes, we can proceed - no need for full test
+                    print("Direct SQL connection test passed, skipping full test")
+                    connection_ok = True
+                    break
+                elif attempt == max_retries - 1:
+                    # On final attempt, try the full test as well
+                    connection_ok = await self.test_sql_connection(session)
+                    if connection_ok:
+                        break
+            
             if not connection_ok:
                 with open(OUTPUT_FILE, "a") as f:
                     f.write("\n===== CONNECTION FAILURE =====\n")
-                    f.write("CRITICAL: Cannot establish SQL connection.\n")
+                    f.write("CRITICAL: Cannot establish SQL connection after multiple attempts.\n")
                     f.write("The SQL Table Assistant requires a working SQL connection to function.\n")
                     f.write("Please fix the connection issues before proceeding.\n\n")
+                    f.write("Common issues:\n")
+                    f.write("1. SQL Server not running or unreachable\n")
+                    f.write("2. Incorrect server name or credentials\n")
+                    f.write("3. Firewall blocking the connection\n")
+                    f.write("4. Wrong ODBC driver or missing driver\n\n")
                     f.write("You may continue in limited mode, but SQL queries will fail.\n")
                     f.write("==============================\n")
                     f.write("\nEnter your Query (or type /exit to quit): ")
                     f.flush()
+                    
+                # Still try to fetch schema, but it will likely fail
+                print("WARNING: Continuing without SQL connection - queries will fail")
             
             # Fetch schema information with timeout
             print("Fetching schema information...")
