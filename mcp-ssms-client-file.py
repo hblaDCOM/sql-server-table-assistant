@@ -18,6 +18,7 @@ import time
 import signal
 import pyodbc
 from math import isnan, isinf
+import io
 
 # Setup logging
 logging.basicConfig(
@@ -1750,208 +1751,250 @@ Schema retrieval encountered errors. Limited table information available:
         """Fetch a preview of the data (first row) to verify SQL connection."""
         print(f"\n===== FETCHING DATA PREVIEW FOR {FULLY_QUALIFIED_TABLE_NAME} =====")
         
-        # First validate connection parameters
-        if not validate_sql_connection_params():
-            with open(OUTPUT_FILE, "a") as f:
-                f.write("\n===== CONNECTION PARAMETER ERROR =====\n")
-                f.write("SQL Server connection cannot be established due to missing parameters.\n")
-                f.write("Please check your .env file and ensure all required variables are set.\n")
-                f.write("Required parameters:\n")
-                f.write("- MSSQL_SERVER\n")
-                f.write("- MSSQL_DATABASE\n")
-                f.write("- MSSQL_USERNAME\n")
-                f.write("- MSSQL_PASSWORD\n")
-                f.write("- MSSQL_DRIVER (or a system ODBC driver must be available)\n")
-                f.write("================================\n")
-            return False
-        
-        # Start by testing the SQL connection thoroughly
-        connection_ok = await self.test_sql_connection(session)
-        if not connection_ok:
-            logger.error("SQL connection test failed, aborting data preview")
-            return False
+        with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n===== FETCHING DATA PREVIEW FOR {FULLY_QUALIFIED_TABLE_NAME} =====\n")
         
         try:
-            # Now that connection is verified, try running a simple preview query
+            # First verify we can connect to SQL Server directly
+            print("Testing direct SQL connection...")
+            
+            with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                f.write("Testing direct SQL connection...\n")
+            
+            # Get connection parameters
+            server = os.getenv('MSSQL_SERVER')
+            database = os.getenv('MSSQL_DATABASE')
+            username = os.getenv('MSSQL_USERNAME')
+            password = os.getenv('MSSQL_PASSWORD')
+            driver = os.getenv('MSSQL_DRIVER', '{ODBC Driver 17 for SQL Server}')
+            
+            if not all([server, database, username, password]):
+                msg = "Missing SQL Server connection parameters. Skipping direct connection test."
+                print(msg)
+                with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+                return
+            
+            # Test direct connection
+            try:
+                print("Connecting to SQL Server directly...")
+                with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                    f.write("Connecting to SQL Server directly...\n")
+                
+                connection_string = f"DRIVER={driver};SERVER={server};DATABASE={database};UID={username};PWD={password}"
+                conn = pyodbc.connect(connection_string)
+                cursor = conn.cursor()
+                
+                # Get server version to verify connection
+                cursor.execute("SELECT @@version")
+                version = cursor.fetchone()[0]
+                print(f"SQL Server version: {version[:100]}...")
+                with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"SQL Server version: {version[:100]}...\n")
+                
+                # Run preview query
+                preview_sql = f"SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}"
+                print(f"Executing preview query directly: {preview_sql}")
+                with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"Executing preview query directly: {preview_sql}\n")
+                
+                cursor.execute(preview_sql)
+                
+                # Fetch column names
+                columns = [column[0] for column in cursor.description]
+                
+                # Fetch rows
+                rows = cursor.fetchall()
+                
+                # Format as tabular display
+                from tabulate import tabulate
+                
+                # Convert rows to list of lists for tabulate
+                data = []
+                for row in rows:
+                    # Convert each value to string, handling None values
+                    row_data = [str(val) if val is not None else 'NULL' for val in row]
+                    data.append(row_data)
+                
+                preview_data = tabulate(data, headers=columns, tablefmt="pipe")
+                
+                print("\n===== DATA PREVIEW =====")
+                print(preview_data)
+                print("=======================\n")
+                
+                with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                    f.write("\n===== DATA PREVIEW =====\n")
+                    f.write(preview_data)
+                    f.write("\n=======================\n\n")
+                
+                # Close connection
+                cursor.close()
+                conn.close()
+                
+                return True
+                
+            except Exception as e:
+                error_msg = f"Error with direct SQL connection: {type(e).__name__}: {str(e)}"
+                print(error_msg)
+                with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                    f.write(error_msg + "\n")
+                
+                import traceback
+                trace = traceback.format_exc()
+                print(trace)
+                with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                    f.write(trace + "\n")
+            
+            # Try using the session tool as fallback
+            print("Falling back to query_table tool...")
+            with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                f.write("Falling back to query_table tool...\n")
+            
             preview_sql = f"SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}"
-            print(f"Executing preview query: {preview_sql}")
             
-            with open(OUTPUT_FILE, "a") as f:
-                f.write(f"\nExecuting data preview query: {preview_sql}\n")
-                f.flush()
-            
-            # Execute query
             result = await session.call_tool("query_table", {"sql": preview_sql})
             preview_data = getattr(result.content[0], "text", "")
             
-            # Check if the result contains error message
             if preview_data.startswith("Error:") or "Error retrieving data" in preview_data:
                 raise Exception(preview_data)
             
-            # Write to output file
-            with open(OUTPUT_FILE, "a") as f:
-                f.write("\n===== DATA PREVIEW =====\n")
-                f.write("Showing first 5 rows of data to verify connection:\n\n")
-                f.write(preview_data)
-                f.write("\n========================\n")
-            
-            print("Data preview fetched successfully:")
+            print("\n===== DATA PREVIEW =====")
             print(preview_data)
-            print("==================================\n")
+            print("=======================\n")
+            
+            with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                f.write("\n===== DATA PREVIEW =====\n")
+                f.write(preview_data)
+                f.write("\n=======================\n\n")
+            
             return True
+            
         except Exception as e:
             error_message = f"Error fetching data preview: {str(e)}"
-            print(f"\n===== DATA PREVIEW ERROR =====")
-            print(error_message)
-            print("==============================\n")
-            
-            # Write detailed error to output file
-            with open(OUTPUT_FILE, "a") as f:
-                f.write("\n===== DATA PREVIEW ERROR =====\n")
-                f.write(f"Failed to fetch data preview: {str(e)}\n\n")
-                f.write("This may indicate connection issues with the SQL server.\n\n")
-                f.write("Try running /diagnose for more information.\n")
-                f.write("==============================\n")
-            return False
-
-    async def run(self):
-        """Main entry point to run the chat session."""
-        try:
-            # Print startup information
-            print(f"\n===== SQL TABLE ASSISTANT STARTUP =====")
-            print(f"Starting file-based client with:")
-            print(f"Input file: {INPUT_FILE}")
-            print(f"Output file: {OUTPUT_FILE}")
-            print(f"Table: {FULLY_QUALIFIED_TABLE_NAME}")
-            print(f"SQL Server environment variables:")
-            print(f"  MSSQL_SERVER: {os.getenv('MSSQL_SERVER', 'Not set')}")
-            print(f"  MSSQL_DATABASE: {os.getenv('MSSQL_DATABASE', 'Not set')}")
-            print(f"  MSSQL_USERNAME: {os.getenv('MSSQL_USERNAME', 'Not set (using Windows Auth)')}")
-            print(f"  MSSQL_PASSWORD: {'[PROVIDED]' if os.getenv('MSSQL_PASSWORD') else 'Not set'}")
-            print(f"  MSSQL_DRIVER: {os.getenv('MSSQL_DRIVER', 'Not set')}")
-            print(f"===================================\n")
-            
-            # Write startup info to output file
-            with open(OUTPUT_FILE, "w") as f:
-                f.write(f"\n===== SQL TABLE ASSISTANT STARTUP =====\n")
-                f.write(f"Starting assistant for table: {FULLY_QUALIFIED_TABLE_NAME}\n")
-                f.write(f"Connected to server: {os.getenv('MSSQL_SERVER', 'Not set')}\n")
-                f.write(f"Database: {os.getenv('MSSQL_DATABASE', 'Not set')}\n")
-                f.write("Initializing connection...\n")
-            
-            # Use the FileBasedClientSession directly
-            print("Creating file-based client session...")
-            session = FileBasedClientSession()
-            print("Initializing session...")
-            
-            # Initialize with timeout
-            init_task = asyncio.create_task(session.initialize())
-            try:
-                await asyncio.wait_for(init_task, timeout=10)
-                print("Session initialized successfully.")
-            except asyncio.TimeoutError:
-                print("Session initialization timed out after 10 seconds")
-                with open(OUTPUT_FILE, "a") as f:
-                    f.write("\nSESSION INITIALIZATION TIMEOUT\n")
-                    f.write("The SQL connection initialization process timed out after 10 seconds.\n")
-                    f.write("This usually indicates a network connectivity issue to the SQL Server.\n")
-                    f.write("Please check your SQL Server connection settings and network connectivity.\n")
-            
-            # First validate SQL connection through explicit testing - with retries
-            connection_ok = False
-            max_retries = 3
-            
-            for attempt in range(max_retries):
-                if attempt > 0:
-                    retry_delay = 5  # seconds
-                    print(f"\nRetrying SQL connection (attempt {attempt+1}/{max_retries}) after {retry_delay} seconds...")
-                    with open(OUTPUT_FILE, "a") as f:
-                        f.write(f"\nRetrying SQL connection (attempt {attempt+1}/{max_retries}) after {retry_delay} seconds...\n")
-                        f.flush()
-                    await asyncio.sleep(retry_delay)
-                
-                # Try direct test first (faster)
-                direct_ok = await self.direct_sql_test()
-                if direct_ok:
-                    # If direct test passes, we can proceed - no need for full test
-                    print("Direct SQL connection test passed, skipping full test")
-                    connection_ok = True
-                    break
-                elif attempt == max_retries - 1:
-                    # On final attempt, try the full test as well
-                    connection_ok = await self.test_sql_connection(session)
-                    if connection_ok:
-                        break
-            
-            if not connection_ok:
-                with open(OUTPUT_FILE, "a") as f:
-                    f.write("\n===== CONNECTION FAILURE =====\n")
-                    f.write("CRITICAL: Cannot establish SQL connection after multiple attempts.\n")
-                    f.write("The SQL Table Assistant requires a working SQL connection to function.\n")
-                    f.write("Please fix the connection issues before proceeding.\n\n")
-                    f.write("Common issues:\n")
-                    f.write("1. SQL Server not running or unreachable\n")
-                    f.write("2. Incorrect server name or credentials\n")
-                    f.write("3. Firewall blocking the connection\n")
-                    f.write("4. Wrong ODBC driver or missing driver\n\n")
-                    f.write("You may continue in limited mode, but SQL queries will fail.\n")
-                    f.write("==============================\n")
-                    f.write("\nEnter your Query (or type /exit to quit): ")
-                    f.flush()
-                    
-                # Still try to fetch schema, but it will likely fail
-                print("WARNING: Continuing without SQL connection - queries will fail")
-            
-            # Fetch schema information with timeout
-            print("Fetching schema information...")
-            with open(OUTPUT_FILE, "a") as f:
-                f.write("\nFetching table schema...\n")
-                
-            schema_task = asyncio.create_task(self.fetch_schema(session))
-            try:
-                await asyncio.wait_for(schema_task, timeout=30)
-                print("Schema fetched successfully.")
-            except asyncio.TimeoutError:
-                print("Schema fetch timed out after 30 seconds")
-                with open(OUTPUT_FILE, "a") as f:
-                    f.write("\nSCHEMA FETCH TIMEOUT\n")
-                    f.write("The schema retrieval process timed out after 30 seconds.\n")
-                    f.write("This usually indicates a problem with the SQL Server connection or permissions.\n")
-                    f.write("Continuing with limited functionality...\n")
-                    
-                # Set default schema if timeout occurred
-                if not self.schema_summary:
-                    self.schema_summary = f"Table: {FULLY_QUALIFIED_TABLE_NAME}\nSchema could not be retrieved due to timeout."
-                    self.system_prompt = self.system_prompt.replace("{schema_summary}", self.schema_summary)
-                    self.system_prompt = self.system_prompt.replace("{table_name}", FULLY_QUALIFIED_TABLE_NAME)
-            
-            # Start the interactive chat loop
-            print("Starting chat loop...")
-            await self.chat_loop(session)
-        except Exception as e:
-            print(f"Error running chat: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Write error to output file
-            with open(OUTPUT_FILE, "a") as f:
-                f.write(f"\n===== FATAL ERROR =====\n")
-                f.write(f"The SQL Table Assistant encountered a fatal error:\n{str(e)}\n\n")
-                f.write("This might be due to SQL Server connection issues or configuration problems.\n")
-                f.write("Please check the following:\n")
-                f.write("1. SQL Server connection settings in your .env file\n")
-                f.write("2. Network connectivity to the SQL Server\n")
-                f.write("3. Proper installation of SQL Server drivers\n")
-                f.write("4. Table name and permissions\n")
-                f.write("===========================\n")
-
-# Main entry point
-if __name__ == "__main__":
-    try:
-        asyncio.run(Chat().run())
-    except KeyboardInterrupt:
-        print("\nProcess interrupted.")
-    except Exception as e:
         print(f"Application error: {e}")
         # Don't wait for Enter in file-based mode
         print("Exiting...") 
+
+    async def run(self):
+        """Main method to run the chat process."""
+        
+        # Clear output file
+        with open(OUTPUT_FILE, "w", encoding='utf-8') as f:
+            f.write("===== SQL TABLE ASSISTANT STARTUP =====\n")
+            f.write(f"Starting assistant for table: {FULLY_QUALIFIED_TABLE_NAME}\n")
+            f.write(f"Connected to server: {os.getenv('MSSQL_SERVER')}\n")
+            f.write(f"Database: {os.getenv('MSSQL_DATABASE')}\n")
+            f.write("Initializing connection...\n")
+            f.write("File-based session initialized.\n\n")
+        
+        print("===== SQL TABLE ASSISTANT STARTUP =====")
+        print(f"Starting assistant for table: {FULLY_QUALIFIED_TABLE_NAME}")
+        print(f"Connected to server: {os.getenv('MSSQL_SERVER')}")
+        print(f"Database: {os.getenv('MSSQL_DATABASE')}")
+        print("Initializing connection...")
+        print("File-based session initialized.\n")
+        
+        # First verify direct SQL connection
+        await self.test_sql_connection()
+        
+        # Start gpt4 client
+        async with stdio_client(server_params) as (read, write):
+            session = ClientSession(read, write)
+            await session.initialize()
+            
+            # Fetch schema
+            schema = await self.fetch_schema(session)
+            
+            if schema:
+                # Create a summary of the schema to use in the system prompt
+                await self.create_schema_summary(schema, session)
+            
+            # Fetch data preview at startup
+            await self.fetch_data_preview(session)
+            
+            # Display initial instructions
+            with open(OUTPUT_FILE, "a", encoding='utf-8') as f:
+                f.write("\nTable Assistant is ready. You are working with table: " + FULLY_QUALIFIED_TABLE_NAME + "\n")
+                f.write("A data preview has been requested to verify the database connection.\n")
+                f.write("This will appear above when the connection is established.\n\n")
+                f.write("Type your questions about the table in natural language, and I'll translate them to SQL.\n")
+                f.write("Special commands:\n")
+                f.write("  /diagnose - Run diagnostics\n")
+                f.write("  /refresh_schema - Refresh table schema\n")
+                f.write("  /preview - Show data preview again\n")
+                f.write("  /history - View query history\n")
+                f.write("  /show-logs [n] - View recent query logs (default: 5)\n\n")
+                f.write("Waiting for your first query...\n\n")
+                f.flush()
+            
+            print("\nTable Assistant is ready. You are working with table: " + FULLY_QUALIFIED_TABLE_NAME)
+            print("A data preview has been requested to verify the database connection.")
+            print("This will appear above when the connection is established.\n")
+            print("Type your questions about the table in natural language, and I'll translate them to SQL.")
+            print("Special commands:")
+            print("  /diagnose - Run diagnostics")
+            print("  /refresh_schema - Refresh table schema")
+            print("  /preview - Show data preview again")
+            print("  /history - View query history")
+            print("  /show-logs [n] - View recent query logs (default: 5)")
+            print("\nWaiting for your first query...\n")
+            
+            # Main processing loop
+            first_query = True
+            while True:
+                # Read from input file
+                query = self.wait_for_input()
+                
+                if not query:
+                    # Probe for aliveness
+                    with open(OUTPUT_FILE, "a", encoding='utf-8') as f:
+                        f.write("\n__PROBE_ACK__: \n")
+                        f.flush()
+                    continue
+                
+                if query.lower() == "__exit__":
+                    print("Exiting SQL Table Assistant. Goodbye!")
+                    break
+                
+                # Clear the input file after reading to prepare for next input
+                with open(INPUT_FILE, "w") as f:
+                    pass
+                
+                # Log start of processing in output file
+                with open(OUTPUT_FILE, "a", encoding='utf-8') as f:
+                    f.write(f"\nEnter your Query (or type /exit to quit): {query}\n")
+                    f.flush()
+                
+                if not query.strip():
+                    print("Empty query received. Waiting for next input...")
+                    continue
+                
+                # Process the query
+                if query.lower() == "/exit":
+                    with open(OUTPUT_FILE, "a", encoding='utf-8') as f:
+                        f.write("Exiting SQL Table Assistant. Goodbye!\n")
+                    break
+                elif query.lower() == "/diagnose":
+                    await self.run_diagnostics(session)
+                elif query.lower() == "/refresh_schema":
+                    await self.fetch_schema(session, force_refresh=True)
+                elif query.lower() == "/preview":
+                    await self.fetch_data_preview(session)
+                elif query.lower() == "/history":
+                    await self.show_query_history()
+                elif query.lower().startswith("/show-logs"):
+                    parts = query.split()
+                    num_logs = 5  # Default
+                    if len(parts) > 1 and parts[1].isdigit():
+                        num_logs = int(parts[1])
+                    await self.show_recent_logs(num_logs)
+                else:
+                    if first_query:
+                        # Print a reminder message for the first query
+                        with open(OUTPUT_FILE, "a", encoding='utf-8') as f:
+                            f.write("Retrieving your table schema...\n")
+                        print("Retrieving your table schema...")
+                        first_query = False
+                    
+                    # Process natural language query
+                    await self.process_query(query, session)

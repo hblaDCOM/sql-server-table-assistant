@@ -37,6 +37,9 @@ try:
     
     # Try to get preview
     print("\n--- Attempting to fetch data preview ---")
+    # Ensure we're using the fully qualified table name with schema
+    if "." not in TABLE_NAME and TABLE_NAME.startswith("Change_"):
+        TABLE_NAME = "change." + TABLE_NAME
     query = f"SELECT TOP 5 * FROM {TABLE_NAME}"
     print(f"Query: {query}")
     

@@ -11,6 +11,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+import pyodbc
+from tabulate import tabulate
 
 load_dotenv()
 
@@ -725,15 +727,153 @@ Schema retrieval encountered errors. Limited table information available:
             print(f"Error retrieving query logs: {e}")
         print("===============================\n")
 
+    async def fetch_data_preview(self, session: ClientSession) -> None:
+        """Fetch a preview of the data (first row) to verify SQL connection."""
+        print(f"\n===== FETCHING DATA PREVIEW FOR {FULLY_QUALIFIED_TABLE_NAME} =====")
+        
+        try:
+            # First verify we can connect to SQL Server directly
+            print("Testing direct SQL connection...")
+            
+            # Get connection parameters
+            server = os.getenv('MSSQL_SERVER')
+            database = os.getenv('MSSQL_DATABASE')
+            username = os.getenv('MSSQL_USERNAME')
+            password = os.getenv('MSSQL_PASSWORD')
+            driver = os.getenv('MSSQL_DRIVER', '{ODBC Driver 17 for SQL Server}')
+            
+            if not all([server, database, username, password]):
+                print("Missing SQL Server connection parameters. Skipping direct connection test.")
+                return
+            
+            # Test direct connection
+            try:
+                print("Connecting to SQL Server directly...")
+                connection_string = f"DRIVER={driver};SERVER={server};DATABASE={database};UID={username};PWD={password}"
+                conn = pyodbc.connect(connection_string)
+                cursor = conn.cursor()
+                
+                # Get server version to verify connection
+                cursor.execute("SELECT @@version")
+                version = cursor.fetchone()[0]
+                print(f"SQL Server version: {version[:100]}...")
+                
+                # Run preview query
+                preview_sql = f"SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}"
+                print(f"Executing preview query directly: {preview_sql}")
+                
+                cursor.execute(preview_sql)
+                
+                # Fetch column names
+                columns = [column[0] for column in cursor.description]
+                
+                # Fetch rows
+                rows = cursor.fetchall()
+                
+                # Format as tabular display
+                from tabulate import tabulate
+                
+                # Convert rows to list of lists for tabulate
+                data = []
+                for row in rows:
+                    # Convert each value to string, handling None values
+                    row_data = [str(val) if val is not None else 'NULL' for val in row]
+                    data.append(row_data)
+                
+                preview_data = tabulate(data, headers=columns, tablefmt="pipe")
+                
+                print("\n===== DATA PREVIEW =====")
+                print(preview_data)
+                print("=======================\n")
+                
+                # Close connection
+                cursor.close()
+                conn.close()
+                
+                return True
+                
+            except Exception as e:
+                print(f"Error with direct SQL connection: {type(e).__name__}: {str(e)}")
+                
+            # Try using the session tool as fallback
+            print("Falling back to query_table tool...")
+            preview_sql = f"SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}"
+            
+            result = await session.call_tool("query_table", {"sql": preview_sql})
+            preview_data = getattr(result.content[0], "text", "")
+            
+            if preview_data.startswith("Error:") or "Error retrieving data" in preview_data:
+                raise Exception(preview_data)
+            
+            print("\n===== DATA PREVIEW =====")
+            print(preview_data)
+            print("=======================\n")
+            
+            return True
+            
+        except Exception as e:
+            error_message = f"Error fetching data preview: {str(e)}"
+            print(f"\n===== DATA PREVIEW ERROR =====")
+            print(error_message)
+            print("==============================\n")
+            
+            return False
+
     async def run(self):
         async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
+            session = ClientSession(read, write)
+            await session.initialize()
+            
+            # Start by retrieving the table schema
+            print("\nFetching table schema...")
+            
+            # First try getting schema using the get_table_schema tool
+            schema = await self.fetch_schema(session)
+            
+            if schema:
+                # Create a summary of the schema to use in the system prompt
+                await self.create_schema_summary(schema)
+            
+            # Display data preview at startup
+            await self.fetch_data_preview(session)
+
+            print("\nType your questions about the table in natural language, and I'll translate them to SQL.")
+            print("Special commands:")
+            print("  /diagnose - Run diagnostics")
+            print("  /refresh_schema - Refresh table schema")
+            print("  /preview - Show data preview again")
+            print("  /history - View query history")
+            print("  /show-logs [n] - View recent query logs (default: 5)")
+            
+            print("\nWaiting for your first query...")
+            
+            # Main chat loop
+            while True:
+                # Prompt for input
+                query = input("\nEnter your Query (or type /exit to quit): ")
                 
-                # Fetch schema information before starting chat loop
-                await self.fetch_schema(session)
-                
-                await self.chat_loop(session)
+                if query.lower() == "/exit":
+                    print("Exiting SQL Table Assistant. Goodbye!")
+                    break
+                elif not query.strip():
+                    continue
+                elif query.lower() == "/diagnose":
+                    await self.run_diagnostics(session)
+                elif query.lower() == "/refresh_schema":
+                    await self.fetch_schema(session)
+                elif query.lower() == "/preview":
+                    await self.fetch_data_preview(session)
+                elif query.lower() == "/history":
+                    await self.show_query_history()
+                elif query.lower().startswith("/show-logs"):
+                    parts = query.split()
+                    num_logs = 5  # Default
+                    if len(parts) > 1 and parts[1].isdigit():
+                        num_logs = int(parts[1])
+                    await self.show_recent_logs(session, num_logs)
+                else:
+                    # Process natural language query
+                    await self.process_query(session, query)
 
 if __name__ == "__main__":
     try:
