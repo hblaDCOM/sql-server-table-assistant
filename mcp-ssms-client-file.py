@@ -36,26 +36,41 @@ print(f"Using output file: {OUTPUT_FILE}")
 # Function to read input from file - for file-based operation
 def get_input(prompt):
     """Get user input from file instead of stdin."""
-    # Print the prompt to output file
+    # Print the prompt to output file, with WAITING_FOR_INPUT tag only once
     with open(OUTPUT_FILE, "a") as f:
         f.write(f"{prompt}\nWAITING_FOR_INPUT\n")
     
+    print(f"Waiting for user input: {prompt}")
+    
     # Wait for input in the input file
     last_modified = os.path.getmtime(INPUT_FILE) if os.path.exists(INPUT_FILE) else 0
+    timeout_seconds = 300  # 5 minute timeout
+    start_time = time.time()
+    
     while True:
         try:
-            if os.path.exists(INPUT_FILE) and os.path.getmtime(INPUT_FILE) > last_modified:
-                with open(INPUT_FILE, "r") as f:
-                    content = f.read().strip()
-                
-                # Clear the file after reading
-                with open(INPUT_FILE, "w") as f:
-                    pass
-                
-                return content
+            # Check if file exists and has been modified
+            if os.path.exists(INPUT_FILE):
+                current_mod_time = os.path.getmtime(INPUT_FILE)
+                if current_mod_time > last_modified:
+                    with open(INPUT_FILE, "r") as f:
+                        content = f.read().strip()
+                    
+                    # Only clear the file if we got content
+                    if content:
+                        with open(INPUT_FILE, "w") as f:
+                            pass
+                        
+                        print(f"Input received: {content[:30]}..." if len(content) > 30 else f"Input received: {content}")
+                        return content
+            
+            # Check for timeout
+            if time.time() - start_time > timeout_seconds:
+                print("Timeout waiting for user input")
+                return "/exit"  # Exit if timeout
             
             # Sleep briefly to avoid CPU spinning
-            time.sleep(0.1)  # Use time.sleep instead of asyncio.sleep
+            time.sleep(0.5)
         except Exception as e:
             print(f"Error reading input: {e}")
             return ""
@@ -82,22 +97,38 @@ class FileBasedClientSession:
             f.write("WAITING_FOR_TOOL_RESULT\n")
         
         # Wait for tool result in input file
+        # Add a flag to track if we've already printed waiting message
+        print(f"Waiting for result of tool call: {tool_name}")
+        
+        # Track file modification time
         last_modified = os.path.getmtime(INPUT_FILE) if os.path.exists(INPUT_FILE) else 0
+        timeout_seconds = 120  # 2 minute timeout
+        start_time = time.time()
+        
         while True:
             try:
-                if os.path.exists(INPUT_FILE) and os.path.getmtime(INPUT_FILE) > last_modified:
-                    with open(INPUT_FILE, "r") as f:
-                        result = f.read().strip()
-                    
-                    # Clear the input file
-                    with open(INPUT_FILE, "w") as f:
-                        pass
-                    
-                    # Return mock response
-                    return MockResponse(result)
+                # Check if file exists and has been modified
+                if os.path.exists(INPUT_FILE):
+                    current_mod_time = os.path.getmtime(INPUT_FILE)
+                    if current_mod_time > last_modified:
+                        with open(INPUT_FILE, "r") as f:
+                            result = f.read().strip()
+                        
+                        # Only clear the file if we got some content
+                        if result:
+                            with open(INPUT_FILE, "w") as f:
+                                pass
+                            
+                            # Return mock response with result
+                            return MockResponse(result)
+                
+                # Check for timeout
+                if time.time() - start_time > timeout_seconds:
+                    print("Timeout waiting for tool result")
+                    return MockResponse(f"Error: Timeout waiting for {tool_name} result")
                 
                 # Sleep briefly to avoid CPU spinning
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.5)
             except Exception as e:
                 print(f"Error waiting for tool result: {e}")
                 return MockResponse(f"Error: {str(e)}")
@@ -729,6 +760,16 @@ Schema retrieval encountered errors. Limited table information available:
 
     async def chat_loop(self, session: ClientSession):
         """Main chat loop for interactive querying."""
+        # Write initial welcome message to output
+        with open(OUTPUT_FILE, "w") as f:
+            f.write(f"\nTable Assistant is ready. You are working with table: {FULLY_QUALIFIED_TABLE_NAME}\n")
+            f.write("Type your questions about the table in natural language, and I'll translate them to SQL.\n")
+            f.write("Special commands:\n")
+            f.write("  /diagnose - Run diagnostics\n")
+            f.write("  /refresh_schema - Refresh table schema\n")
+            f.write("  /history - View query history\n")
+            f.write("  /show-logs [n] - View recent query logs (default: 5)\n\n")
+        
         print(f"\nTable Assistant is ready. You are working with table: {FULLY_QUALIFIED_TABLE_NAME}")
         print("Type your questions about the table in natural language, and I'll translate them to SQL.")
         print("Special commands:")
@@ -739,16 +780,21 @@ Schema retrieval encountered errors. Limited table information available:
         
         while True:
             try:
+                # Request input only once per loop iteration
                 query = get_input("\nEnter your Query (or type /exit to quit): ").strip()
                 
                 if not query:
+                    print("Empty query received, please try again")
                     continue
                     
                 if query.lower() == "/exit":
                     print("\nExiting...")
+                    # Write exit message to output file
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write("\nExiting SQL Assistant...\n")
                     break
                     
-                # Special commands
+                # Process special commands
                 if query.lower() == "/diagnose":
                     await self.run_diagnostics(session)
                     continue
@@ -770,11 +816,17 @@ Schema retrieval encountered errors. Limited table information available:
                     await self.show_recent_logs(session, n)
                     continue
                 
-                # Process regular queries
+                # Process regular queries - write to output file first to confirm receipt
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"\nProcessing: {query}\n")
+                
+                # Process the query
                 await self.process_query(session, query)
                 
             except Exception as e:
                 print(f"Error in chat loop: {e}")
+                import traceback
+                traceback.print_exc()
                 # Sleep briefly to avoid busy-waiting in case of persistent errors
                 await asyncio.sleep(1)
 
