@@ -88,14 +88,10 @@ connection_string = (
     f"SERVER={MSSQL_SERVER};"
     f"DATABASE={MSSQL_DATABASE};"
     f"UID={MSSQL_USERNAME};"
-    f"PWD={MSSQL_PASSWORD};"
-    f"Authentication=SqlPassword;"
-    f"Encrypt=yes;"
-    f"TrustServerCertificate=yes;"
-    f"Connection Timeout=30"
+    f"PWD={MSSQL_PASSWORD}"
 )
 
-logger.debug(f"Connection string created (password masked): DRIVER={MSSQL_DRIVER};SERVER={MSSQL_SERVER};DATABASE={MSSQL_DATABASE};UID={MSSQL_USERNAME};PWD=******;Authentication=SqlPassword;Encrypt=yes;TrustServerCertificate=yes")
+logger.debug(f"Connection string created (password masked): DRIVER={MSSQL_DRIVER};SERVER={MSSQL_SERVER};DATABASE={MSSQL_DATABASE};UID={MSSQL_USERNAME};PWD=******")
 logger.info(f"Configured to work with table: {FULLY_QUALIFIED_TABLE_NAME}")
 
 # Creating an MCP server instance
@@ -518,7 +514,7 @@ def query_table(sql: str) -> str:
     try:
         # Set an explicit timeout for connection
         logger.debug("Attempting to connect with explicit timeout (30 seconds)")
-        conn = pyodbc.connect(connection_string, timeout=30)
+        conn = pyodbc.connect(connection_string)
         
         cursor = conn.cursor()
         
@@ -1005,11 +1001,7 @@ def test_connection() -> str:
             f"DRIVER={MSSQL_DRIVER};"
             f"SERVER={MSSQL_SERVER};"
             f"UID={MSSQL_USERNAME};"
-            f"PWD={MSSQL_PASSWORD};"
-            f"Authentication=SqlPassword;"
-            f"Encrypt=yes;"
-            f"TrustServerCertificate=yes;"
-            f"Connection Timeout=10"
+            f"PWD={MSSQL_PASSWORD}"
         )
         
         try:
@@ -1017,7 +1009,7 @@ def test_connection() -> str:
             results.append("Attempting to connect to server only...")
             
             # Try to connect to just the server
-            server_conn = pyodbc.connect(server_conn_string, timeout=10)
+            server_conn = pyodbc.connect(server_conn_string)
             server_cursor = server_conn.cursor()
             
             # Simple test query
@@ -1048,11 +1040,7 @@ def test_connection() -> str:
             f"SERVER={MSSQL_SERVER};"
             f"DATABASE={MSSQL_DATABASE};"
             f"UID={MSSQL_USERNAME};"
-            f"PWD={MSSQL_PASSWORD};"
-            f"Authentication=SqlPassword;"
-            f"Encrypt=yes;"
-            f"TrustServerCertificate=yes;"
-            f"Connection Timeout=10"
+            f"PWD={MSSQL_PASSWORD}"
         )
         
         try:
@@ -1060,7 +1048,7 @@ def test_connection() -> str:
             results.append("Attempting to connect to database...")
             
             # Create connection with explicit timeout
-            db_conn = pyodbc.connect(db_conn_string, timeout=10)
+            db_conn = pyodbc.connect(db_conn_string)
             
             # Test basic connectivity
             db_cursor = db_conn.cursor()
@@ -1090,7 +1078,7 @@ def test_connection() -> str:
         results.append("\nSTEP 3: Testing table existence")
         
         # Create connection with the full string
-        conn = pyodbc.connect(connection_string, timeout=10)
+        conn = pyodbc.connect(connection_string)
         cursor = conn.cursor()
         
         # Try different ways to verify table existence
