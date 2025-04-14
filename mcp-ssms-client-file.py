@@ -951,18 +951,40 @@ Schema retrieval encountered errors. Limited table information available:
         """Fetch a preview of the data (first row) to verify SQL connection."""
         print(f"\n===== FETCHING DATA PREVIEW FOR {FULLY_QUALIFIED_TABLE_NAME} =====")
         try:
-            # Simple query to get top 1 row with all fields
-            preview_sql = f"SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}"
-            
             # Write to output file first to let user know we're checking the connection
             with open(OUTPUT_FILE, "a") as f:
                 f.write("\n===== CHECKING DATABASE CONNECTION =====\n")
                 f.write(f"Connecting to table: {FULLY_QUALIFIED_TABLE_NAME}\n")
+                f.write(f"Connection parameters: Server={os.getenv('MSSQL_SERVER', 'Not set')}, Database={os.getenv('MSSQL_DATABASE', 'Not set')}\n")
                 f.write("Fetching sample data...\n")
+            
+            # Try a connection test query first
+            try:
+                test_result = await session.call_tool("test_connection", {})
+                test_status = getattr(test_result.content[0], "text", "")
+                
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"\n--- Connection Test Result ---\n{test_status}\n\n")
+                
+                if "Connection failed" in test_status:
+                    raise Exception(f"SQL Server connection test failed: {test_status}")
+                
+                print(f"Connection test result: {test_status}")
+            except Exception as conn_err:
+                print(f"Connection test error: {conn_err}")
+                # Continue anyway to get more specific error
+
+            # Simple query to get top 5 rows with all fields
+            preview_sql = f"SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}"
+            print(f"Executing preview query: {preview_sql}")
             
             # Execute query
             result = await session.call_tool("query_table", {"sql": preview_sql})
             preview_data = getattr(result.content[0], "text", "")
+            
+            # Check if the result contains error message
+            if preview_data.startswith("Error:") or "Error retrieving data" in preview_data:
+                raise Exception(preview_data)
             
             # Write to output file
             with open(OUTPUT_FILE, "a") as f:
@@ -979,17 +1001,37 @@ Schema retrieval encountered errors. Limited table information available:
             error_message = f"Error fetching data preview: {str(e)}"
             print(f"\n===== DATA PREVIEW ERROR =====")
             print(error_message)
+            print("Full exception details:", repr(e))
             print("==============================\n")
             
-            # Write error to output file
+            # Get diagnostic information
+            try:
+                # Try to run diagnostics to get more info
+                diag_result = await session.call_tool("diagnose_table_access", {})
+                diagnostics = getattr(diag_result.content[0], "text", "")
+            except:
+                diagnostics = "Could not retrieve diagnostics information"
+            
+            # Write detailed error to output file
             with open(OUTPUT_FILE, "a") as f:
                 f.write("\n===== DATA PREVIEW ERROR =====\n")
-                f.write(f"Failed to fetch data preview: {str(e)}\n")
-                f.write("This may indicate connection issues with the SQL server.\n")
-                f.write("Try checking:\n")
-                f.write("1. The table name is correct\n")
-                f.write("2. Database credentials are valid\n")
-                f.write("3. Network connectivity to the SQL Server\n")
+                f.write(f"Failed to fetch data preview: {str(e)}\n\n")
+                f.write("This may indicate connection issues with the SQL server.\n\n")
+                f.write("===== CONNECTION DETAILS =====\n")
+                f.write(f"Table: {FULLY_QUALIFIED_TABLE_NAME}\n")
+                f.write(f"Server: {os.getenv('MSSQL_SERVER', 'Not configured')}\n")
+                f.write(f"Database: {os.getenv('MSSQL_DATABASE', 'Not configured')}\n")
+                f.write(f"Driver: {os.getenv('MSSQL_DRIVER', 'Not configured')}\n")
+                f.write(f"Authentication: Using {'SQL Server Authentication' if os.getenv('MSSQL_USERNAME') else 'Windows Authentication'}\n\n")
+                f.write("===== DIAGNOSTICS =====\n")
+                f.write(diagnostics + "\n\n")
+                f.write("===== TROUBLESHOOTING STEPS =====\n")
+                f.write("1. Verify the table name is correct and exists\n")
+                f.write("2. Check that database credentials are valid\n")
+                f.write("3. Ensure SQL Server is running and accessible\n")
+                f.write("4. Verify network connectivity to the SQL Server\n")
+                f.write("5. Check that SQL login has permissions to access the table\n")
+                f.write("6. Try running /diagnose command for more information\n")
                 f.write("==============================\n")
             return False
 
