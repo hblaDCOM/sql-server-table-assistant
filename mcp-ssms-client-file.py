@@ -19,7 +19,13 @@ client = AzureOpenAI(
 )
 
 # Get the table name from environment variables or use a default
-FULLY_QUALIFIED_TABLE_NAME = os.getenv("SQL_TABLE_NAME", "dbo.YourTableName")
+# Also check command line arguments for table name (position 3)
+if len(sys.argv) >= 4:
+    FULLY_QUALIFIED_TABLE_NAME = sys.argv[3]
+else:
+    FULLY_QUALIFIED_TABLE_NAME = os.getenv("SQL_TABLE_NAME", "dbo.YourTableName")
+
+print(f"Using table: {FULLY_QUALIFIED_TABLE_NAME}")
 
 # Parse command line arguments for input/output files
 if len(sys.argv) >= 3:
@@ -36,17 +42,43 @@ print(f"Using output file: {OUTPUT_FILE}")
 # Function to read input from file - for file-based operation
 def get_input(prompt):
     """Get user input from file instead of stdin."""
-    # Print the prompt to output file, with WAITING_FOR_INPUT tag only once
+    # Print the prompt to output file WITHOUT waiting tag
     with open(OUTPUT_FILE, "a") as f:
-        f.write(f"{prompt}\nWAITING_FOR_INPUT\n")
+        f.write(f"{prompt}\n")
     
     print(f"Waiting for user input: {prompt}")
+    
+    # Flag file approach - write a flag file that the web server will check
+    flag_file = f"{INPUT_FILE}.waiting"
+    with open(flag_file, "w") as f:
+        f.write("waiting for input")
     
     # Wait for input in the input file
     last_modified = os.path.getmtime(INPUT_FILE) if os.path.exists(INPUT_FILE) else 0
     timeout_seconds = 300  # 5 minute timeout
     start_time = time.time()
     
+    # Single attempt to read existing content
+    if os.path.exists(INPUT_FILE):
+        try:
+            with open(INPUT_FILE, "r") as f:
+                content = f.read().strip()
+            
+            if content and content != "__HEARTBEAT__":
+                # Clear the file after reading
+                with open(INPUT_FILE, "w") as f:
+                    pass
+                
+                # Clear the flag file
+                if os.path.exists(flag_file):
+                    os.remove(flag_file)
+                    
+                print(f"Input received: {content[:30]}..." if len(content) > 30 else f"Input received: {content}")
+                return content
+        except Exception as e:
+            print(f"Error reading initial input: {e}")
+    
+    # Now wait for new content
     while True:
         try:
             # Check if file exists and has been modified
@@ -56,23 +88,38 @@ def get_input(prompt):
                     with open(INPUT_FILE, "r") as f:
                         content = f.read().strip()
                     
-                    # Only clear the file if we got content
+                    # Skip heartbeat messages
+                    if content == "__HEARTBEAT__":
+                        last_modified = current_mod_time
+                        continue
+                    
+                    # Only clear the file if we got real content
                     if content:
                         with open(INPUT_FILE, "w") as f:
                             pass
                         
+                        # Clear the flag file
+                        if os.path.exists(flag_file):
+                            os.remove(flag_file)
+                            
                         print(f"Input received: {content[:30]}..." if len(content) > 30 else f"Input received: {content}")
                         return content
             
             # Check for timeout
             if time.time() - start_time > timeout_seconds:
                 print("Timeout waiting for user input")
+                # Clear the flag file
+                if os.path.exists(flag_file):
+                    os.remove(flag_file)
                 return "/exit"  # Exit if timeout
             
             # Sleep briefly to avoid CPU spinning
             time.sleep(0.5)
         except Exception as e:
             print(f"Error reading input: {e}")
+            # Clear the flag file
+            if os.path.exists(flag_file):
+                os.remove(flag_file)
             return ""
 
 # Simple mock ClientSession for file-based operation
@@ -90,14 +137,29 @@ class FileBasedClientSession:
             def __init__(self, text):
                 self.content = [type('obj', (object,), {'text': text})]
         
-        # Write tool call to output
-        with open(OUTPUT_FILE, "a") as f:
-            f.write(f"TOOL_CALL: {tool_name}\n")
-            f.write(f"ARGS: {json.dumps(args)}\n")
-            f.write("WAITING_FOR_TOOL_RESULT\n")
+        # Log more details for SQL queries to help with debugging
+        if tool_name == "query_table" and "sql" in args:
+            print(f"Executing SQL query: {args['sql']}")
+            
+            # Write tool call to output with better formatting
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\n--- Executing SQL Query ---\n")
+                f.write(f"{args['sql']}\n")
+                f.write("---------------------------\n")
+                f.write("WAITING_FOR_RESULT\n")
+        else:
+            # Write generic tool call to output
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\nTOOL_CALL: {tool_name}\n")
+                f.write(f"ARGS: {json.dumps(args)}\n")
+                f.write("WAITING_FOR_TOOL_RESULT\n")
+        
+        # Flag file approach - write a flag file that the web server will check
+        flag_file = f"{INPUT_FILE}.waiting_tool"
+        with open(flag_file, "w") as f:
+            f.write(f"waiting for tool result: {tool_name}")
         
         # Wait for tool result in input file
-        # Add a flag to track if we've already printed waiting message
         print(f"Waiting for result of tool call: {tool_name}")
         
         # Track file modification time
@@ -114,23 +176,38 @@ class FileBasedClientSession:
                         with open(INPUT_FILE, "r") as f:
                             result = f.read().strip()
                         
+                        # Handle heartbeat messages
+                        if result == "__HEARTBEAT__":
+                            last_modified = current_mod_time
+                            continue
+                            
                         # Only clear the file if we got some content
                         if result:
                             with open(INPUT_FILE, "w") as f:
                                 pass
                             
+                            # Clear the flag file
+                            if os.path.exists(flag_file):
+                                os.remove(flag_file)
+                                
                             # Return mock response with result
                             return MockResponse(result)
                 
                 # Check for timeout
                 if time.time() - start_time > timeout_seconds:
                     print("Timeout waiting for tool result")
+                    # Clear the flag file
+                    if os.path.exists(flag_file):
+                        os.remove(flag_file)
                     return MockResponse(f"Error: Timeout waiting for {tool_name} result")
                 
                 # Sleep briefly to avoid CPU spinning
                 await asyncio.sleep(0.5)
             except Exception as e:
                 print(f"Error waiting for tool result: {e}")
+                # Clear the flag file
+                if os.path.exists(flag_file):
+                    os.remove(flag_file)
                 return MockResponse(f"Error: {str(e)}")
 
 @dataclass
@@ -787,6 +864,10 @@ Schema retrieval encountered errors. Limited table information available:
                 # Request input only once per loop iteration
                 query = get_input("\nEnter your Query (or type /exit to quit): ").strip()
                 
+                # Skip heartbeat messages
+                if query == "__HEARTBEAT__":
+                    continue
+                
                 if not query:
                     print("Empty query received, please try again")
                     continue
@@ -862,14 +943,22 @@ Schema retrieval encountered errors. Limited table information available:
         print(f"\n===== FETCHING DATA PREVIEW FOR {FULLY_QUALIFIED_TABLE_NAME} =====")
         try:
             # Simple query to get top 1 row with all fields
-            preview_sql = f"SELECT TOP 1 * FROM {FULLY_QUALIFIED_TABLE_NAME}"
+            preview_sql = f"SELECT TOP 5 * FROM {FULLY_QUALIFIED_TABLE_NAME}"
+            
+            # Write to output file first to let user know we're checking the connection
+            with open(OUTPUT_FILE, "a") as f:
+                f.write("\n===== CHECKING DATABASE CONNECTION =====\n")
+                f.write(f"Connecting to table: {FULLY_QUALIFIED_TABLE_NAME}\n")
+                f.write("Fetching sample data...\n")
+            
+            # Execute query
             result = await session.call_tool("query_table", {"sql": preview_sql})
             preview_data = getattr(result.content[0], "text", "")
             
             # Write to output file
             with open(OUTPUT_FILE, "a") as f:
                 f.write("\n===== DATA PREVIEW =====\n")
-                f.write("Showing first row of data to verify connection:\n\n")
+                f.write("Showing first 5 rows of data to verify connection:\n\n")
                 f.write(preview_data)
                 f.write("\n========================\n")
             
@@ -888,6 +977,10 @@ Schema retrieval encountered errors. Limited table information available:
                 f.write("\n===== DATA PREVIEW ERROR =====\n")
                 f.write(f"Failed to fetch data preview: {str(e)}\n")
                 f.write("This may indicate connection issues with the SQL server.\n")
+                f.write("Try checking:\n")
+                f.write("1. The table name is correct\n")
+                f.write("2. Database credentials are valid\n")
+                f.write("3. Network connectivity to the SQL Server\n")
                 f.write("==============================\n")
             return False
 
