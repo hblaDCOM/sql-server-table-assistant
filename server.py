@@ -23,7 +23,7 @@ SQL_SERVER = os.getenv("MSSQL_SERVER")
 SQL_DATABASE = os.getenv("MSSQL_DATABASE")
 SQL_USERNAME = os.getenv("MSSQL_USERNAME") 
 SQL_PASSWORD = os.getenv("MSSQL_PASSWORD")
-SQL_DRIVER = os.getenv("MSSQL_DRIVER", "{ODBC Driver 17 for SQL Server}")
+# SQL_DRIVER = os.getenv("MSSQL_DRIVER", "{ODBC Driver 17 for SQL Server}")
 TABLE_SCHEMA = os.getenv("MSSQL_TABLE_SCHEMA", "dbo")
 TABLE_NAME = os.getenv("MSSQL_TABLE_NAME")
 FULLY_QUALIFIED_TABLE_NAME = f"{TABLE_SCHEMA}.{TABLE_NAME}" if TABLE_SCHEMA else TABLE_NAME
@@ -37,7 +37,7 @@ openai_client = AzureOpenAI(
 OPENAI_DEPLOYMENT_ID = os.getenv("AZURE_OPENAI_DEPLOYMENT_ID")
 
 # Build the connection string
-connection_string = f"DRIVER={SQL_DRIVER};SERVER={SQL_SERVER};DATABASE={SQL_DATABASE};UID={SQL_USERNAME};PWD={SQL_PASSWORD}"
+connection_string = f"DRIVER=ODBC Driver 17 for SQL Server;SERVER={SQL_SERVER};DATABASE={SQL_DATABASE};UID={SQL_USERNAME};PWD={SQL_PASSWORD}"
 
 # Store table schema for LLM context
 table_schema = ""
